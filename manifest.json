@@ -1,0 +1,11 @@
+{
+  "name": "Lyrics Translate",
+  "description": "Shows translations below Spotify lyrics using Google Translate, DeepL, Microsoft Translator or Google Cloud Translation. Experimental.",
+  "preview": "assets/logo.png",
+  "main": "lyrics-translate.js",
+  "readme": "README.md",
+  "authors": [
+    { "name": "expires0n", "url": "https://github.com/expires0n" }
+  ],
+  "tags": ["lyrics", "translation", "deepl", "google-translate", "microsoft-translator"]
+}

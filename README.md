@@ -1,6 +1,12 @@
 # Lyrics Translate
 
+<p align="center">
+  <img src="assets/logo.png" alt="Lyrics Translate logo" width="420">
+</p>
+
 A [Spicetify](https://spicetify.app) extension that shows translations directly below Spotify's lyrics.
+
+> **Status: experimental.** This project is a work in progress and is not stable yet. Lyrics come from Spotify's internal endpoints, and Google Translate uses an unofficial endpoint. An update to either one can break things at any time, so expect bugs and rough edges. Please report problems in the issues tab.
 
 ## Features
 
