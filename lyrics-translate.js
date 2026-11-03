@@ -227,11 +227,49 @@ var LyricsTranslate = (function () {
     return index.length;
   }
 
+  // Spicetify's CosmosAsync wrapper misreads Spotify 1.3.x as a legacy client and forwards
+  // full spclient URLs to Spotify's native resolver, which fails with "Resolver not found!".
+  // So the lyrics request is sent with fetch and the same headers Spicetify itself injects,
+  // and CosmosAsync is only used when no token is available or the direct request fails.
+  function spClientHeaders() {
+    try {
+      const platform = Spicetify.Platform;
+      const token = platform && platform.AuthorizationAPI && platform.AuthorizationAPI.getState().token.accessToken;
+      if (!token) return null;
+      return {
+        Authorization: "Bearer " + token,
+        "Spotify-App-Version": platform.version || "",
+        "App-Platform": (platform.PlatformData && platform.PlatformData.app_platform) || "",
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function requestLyrics(url) {
+    const headers = spClientHeaders();
+    if (headers && typeof fetch === "function") {
+      try {
+        const res = await fetch(url, { headers });
+        if (!res.ok) {
+          const err = new Error(`Spotify returned HTTP ${res.status}.`);
+          err.status = res.status;
+          throw err;
+        }
+        return await res.json();
+      } catch (err) {
+        if (err && err.status) throw err;
+        console.warn("[Lyrics Translate] Direct lyrics request failed, retrying through CosmosAsync", err);
+      }
+    }
+    return Spicetify.CosmosAsync.get(url, undefined, { "app-platform": "WebPlayer" });
+  }
+
   async function fetchLyrics(trackId) {
     const url = `${LYRICS_ENDPOINT}${trackId}?format=json&vocalRemoval=false&market=from_token`;
     let body;
     try {
-      body = await Spicetify.CosmosAsync.get(url, undefined, { "app-platform": "WebPlayer" });
+      body = await requestLyrics(url);
     } catch (err) {
       const status = err && (err.status || err.code);
       if (status === 404) throw new LtError("No lyrics found for this track.", "NO_LYRICS", 404);
@@ -1019,6 +1057,7 @@ var LyricsTranslate = (function () {
     PROVIDER_LABELS,
     translateCurrentTrack,
     cacheClear,
+    fetchLyrics,
     toGoogleCode,
     chunk,
     batchByLimits,
