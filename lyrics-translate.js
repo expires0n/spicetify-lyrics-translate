@@ -1,5 +1,5 @@
 // NAME: Lyrics Translate
-// DESCRIPTION: Adds translations below Spotify lyrics using Google Translate, DeepL, Microsoft Translator or Google Cloud Translation. Microphone button: left-click toggles the translation, right-click opens the settings.
+// DESCRIPTION: Adds translations below Spotify lyrics using Google Translate, DeepL, Microsoft Translator, Google Cloud Translation or a self-hosted AI server. Globe button: left-click toggles the translation, right-click opens the settings.
 // VERSION: 2.0.0
 
 var LyricsTranslate = (function () {
@@ -14,6 +14,7 @@ var LyricsTranslate = (function () {
   const INLINE_ATTR = "data-lt-tr";
   const INIT_RETRY_LIMIT = 100;
   const POLL_MS = 2500;
+  const SONG_CHANGE_DEBOUNCE_MS = 1500;
 
   const DEFAULT_PROXY = "http://127.0.0.1:8787";
   const GTX_ENDPOINT = "https://translate.googleapis.com/translate_a/single";
@@ -26,6 +27,9 @@ var LyricsTranslate = (function () {
   const GCLOUD_MAX_LINES = 50;
   const GCLOUD_MAX_CHARS = 5000;
   const LYRICS_ENDPOINT = "https://spclient.wg.spotify.com/color-lyrics/v2/track/";
+  const LLM_TIMEOUT_MS = 60 * 1000;
+  const LLM_WAKE_MS = 5 * 60 * 1000;
+
 
   const LINKS = {
     deeplSignup: "https://www.deepl.com/pro-api",
@@ -40,6 +44,9 @@ var LyricsTranslate = (function () {
     msKey: "",
     msRegion: "",
     gcKey: "",
+    llmUrl: "",
+    llmToken: "",
+    llmModel: "auto",
     targetLang: "TR",
     sourceLang: "auto",
     inline: true,
@@ -79,7 +86,7 @@ var LyricsTranslate = (function () {
   let initAttempts = 0;
   let namesCache = null;
   let observer = null;
-  const state = { inline: false, trackId: null, token: 0, loading: false, map: null, words: null };
+  const state = { inline: false, trackId: null, token: 0, loading: false, map: null, words: null, pendingTrackId: null, pendingSince: 0, failedUntil: 0, failedTrackId: null, pendingTimer: null };
 
   class LtError extends Error {
     constructor(message, code, status) {
@@ -227,19 +234,110 @@ var LyricsTranslate = (function () {
     return index.length;
   }
 
+  // Spicetify 2.45.0 routes spclient URLs to Spotify's native resolver when the Spotify client is 1.3.x,
+  // which fails with "Resolver not found!" (see PR #1). So the lyrics request is sent with fetch first, using
+  // the token and headers Spicetify's own CosmosAsync wrapper injects for spclient URLs
+  // (src/jsHelper/spicetifyWrapper/platform.js in spicetify-cli). CosmosAsync remains the fallback.
+  function spClientHeaders() {
+    try {
+      const platform = Spicetify.Platform;
+      const token = platform && platform.AuthorizationAPI && platform.AuthorizationAPI.getState().token.accessToken;
+      if (!token) return null;
+      return {
+        Authorization: "Bearer " + token,
+        "Spotify-App-Version": platform.version || "",
+        "App-Platform": (platform.PlatformData && platform.PlatformData.app_platform) || "",
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function requestLyricsDirect(url) {
+    const headers = spClientHeaders();
+    if (!headers || typeof fetch !== "function") {
+      throw new LtError("Direct lyrics request is not available.", "NO_DIRECT");
+    }
+    const res = await fetch(url, { headers });
+    if (!res.ok) throw new LtError(`Spotify returned HTTP ${res.status}.`, "LYRICS_HTTP", res.status);
+    return res.json();
+  }
+
+  // CosmosAsync does not throw on HTTP errors. It resolves with { code, error, message } instead
+  // (checked in spicetify-cli platform.js), so the status has to be read from the returned body.
+  function lyricsErrorStatus(body) {
+    return body && !body.lyrics && typeof body.code === "number" && body.code >= 400 ? body.code : 0;
+  }
+
+  function lyricsStatusError(status) {
+    if (status === 404) return new LtError("No lyrics found for this track.", "NO_LYRICS", 404);
+    if (status === 401 || status === 403) {
+      return new LtError(
+        `Could not fetch lyrics: Spotify denied access (HTTP ${status}). Make sure you are signed in.`,
+        "LYRICS_AUTH",
+        status
+      );
+    }
+    if (status === 429) {
+      return new LtError(
+        "Could not fetch lyrics: Spotify is rate limiting requests (HTTP 429). Try again later.",
+        "LYRICS_RATE_LIMIT",
+        status
+      );
+    }
+    if (status >= 500) {
+      return new LtError(
+        `Could not fetch lyrics: Spotify server error (HTTP ${status}). Try again later.`,
+        "LYRICS_SERVER",
+        status
+      );
+    }
+    return new LtError(`Could not fetch lyrics: Spotify returned HTTP ${status}.`, "LYRICS_FETCH", status);
+  }
+
+  // Lyrics are fetched once per track. The memo is replaced when the track changes.
+  let lyricsMemo = null;
+
   async function fetchLyrics(trackId) {
+    if (lyricsMemo && lyricsMemo.trackId === trackId) return lyricsMemo.data;
+
     const url = `${LYRICS_ENDPOINT}${trackId}?format=json&vocalRemoval=false&market=from_token`;
     let body;
+    let directErr = null;
     try {
-      body = await Spicetify.CosmosAsync.get(url, undefined, { "app-platform": "WebPlayer" });
+      body = await requestLyricsDirect(url);
     } catch (err) {
-      const status = err && (err.status || err.code);
-      if (status === 404) throw new LtError("No lyrics found for this track.", "NO_LYRICS", 404);
-      throw new LtError("Could not fetch lyrics: " + ((err && err.message) || "unknown error"), "LYRICS_FETCH");
+      directErr = err;
     }
-    const lines = body && body.lyrics && Array.isArray(body.lyrics.lines) ? body.lyrics.lines : [];
+
+    // An HTTP status from the direct request is final: CosmosAsync would send the same request again.
+    // Only a statusless failure (no token, blocked fetch) falls back to CosmosAsync.
+    if (directErr) {
+      if (directErr.status) throw lyricsStatusError(directErr.status);
+      try {
+        body = await Spicetify.CosmosAsync.get(url, undefined, { "app-platform": "WebPlayer" });
+      } catch (err) {
+        const cosmosStatus = err && (err.status || err.code);
+              if (typeof cosmosStatus === "number" && cosmosStatus >= 400) throw lyricsStatusError(cosmosStatus);
+        throw new LtError("Could not fetch lyrics: " + ((err && err.message) || "unknown error"), "LYRICS_FETCH");
+      }
+    }
+
+    const status = lyricsErrorStatus(body);
+    if (status) throw lyricsStatusError(status);
+
+    const lyrics = body && body.lyrics;
+    const lines = lyrics && Array.isArray(lyrics.lines) ? lyrics.lines : [];
     if (lines.length === 0) throw new LtError("No lyrics found for this track.", "NO_LYRICS");
-    return lines.map((line) => (line && typeof line.words === "string" ? line.words.trim() : ""));
+
+    const data = {
+      lines: lines.map((line) => (line && typeof line.words === "string" ? line.words.trim() : "")),
+      // Field names are NOT verified against a live response. If they are missing, the language skip never triggers.
+      language: typeof lyrics.language === "string" ? lyrics.language : "",
+      isRtlLanguage: !!lyrics.isRtlLanguage,
+    };
+    lyricsMemo = { trackId, data };
+    return data;
   }
 
   const GTX_BLOCK_KEY = PREFIX + "gtxBlock";
@@ -464,14 +562,65 @@ var LyricsTranslate = (function () {
     return out;
   }
 
+  const LLM_MODELS = ["auto", "gemini", "groq", "gptoss"];
+  const llmBase = (s) => String(s.llmUrl || "").trim().replace(/\/+$/, "");
+
+  // Sends all lines in one request to llm-proxy.mjs. The server tries its models in order and answers
+  // with exactly one translation per line. Anything else counts as a failure, so translateTexts()
+  // falls back to Google.
+  async function llmTranslate(texts, s) {
+    const base = llmBase(s);
+    const lines = texts.map((t) => String(t).replace(/\s+/g, " ").trim());
+    const payload = { lines, target: s.targetLang, model: LLM_MODELS.includes(s.llmModel) ? s.llmModel : "auto" };
+    if (s.sourceLang && s.sourceLang !== "auto") payload.source = s.sourceLang;
+    const headers = { "Content-Type": "application/json" };
+    const token = String(s.llmToken || "").trim();
+    if (token) headers.Authorization = "Bearer " + token;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    let res;
+    let data;
+    try {
+      res = await fetch(`${base}/v1/translate`, { method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal });
+      data = await res.json().catch(() => null);
+    } catch (err) {
+      const reason = err && err.name === "AbortError" ? `no answer within ${LLM_TIMEOUT_MS / 1000} s` : "server not reachable";
+      throw new LtError(`Could not reach the AI server (${reason}).`, "NETWORK");
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      throw new LtError("AI server error: " + ((data && data.message) || `HTTP ${res.status}`), "HTTP", res.status);
+    }
+    const list = data && data.lines;
+    if (!Array.isArray(list) || list.length !== lines.length || list.some((t) => typeof t !== "string" || !t.trim())) {
+      throw new LtError("The AI server returned an unexpected response.", "BAD_RESPONSE");
+    }
+    return list.map((t) => t.trim());
+  }
+
+  // Render's free plan puts the server to sleep after 15 minutes without requests, and waking it takes
+  // about a minute. A /health request on song changes keeps it awake while music plays.
+  let llmWokeAt = 0;
+  function wakeLlm() {
+    const s = loadSettings();
+    const base = llmBase(s);
+    if (s.provider !== "llm" || !base || Date.now() - llmWokeAt < LLM_WAKE_MS) return;
+    llmWokeAt = Date.now();
+    fetch(`${base}/health`).catch(() => {});
+  }
+
   const PROVIDER_LABELS = {
     deepl: "DeepL",
     microsoft: "Microsoft Translator",
     googleCloud: "Google Cloud Translation",
+    llm: "AI translation",
   };
-  const PROVIDER_KEY_FIELD = { deepl: "deeplKey", microsoft: "msKey", googleCloud: "gcKey" };
+  const PROVIDER_KEY_FIELD = { deepl: "deeplKey", microsoft: "msKey", googleCloud: "gcKey", llm: "llmUrl" };
 
   function translateWith(provider, texts, s) {
+    if (provider === "llm") return llmTranslate(texts, s);
     if (provider === "deepl") return deeplTranslate(texts, s);
     if (provider === "microsoft") return microsoftTranslate(texts, s);
     if (provider === "googleCloud") return googleCloudTranslate(texts, s);
@@ -487,7 +636,8 @@ var LyricsTranslate = (function () {
     const label = PROVIDER_LABELS[provider];
     if (!String(s[PROVIDER_KEY_FIELD[provider]] || "").trim()) {
       const items = await googleTranslate(texts, s);
-      return { items, provider: "google", notice: `${label} key is not set, so it was translated with Google.` };
+       const missing = provider === "llm" ? "server address" : "key";
+      return { items, provider: "google", notice: `${label} ${missing} is not set, so it was translated with Google.` };
     }
     try {
       const items = await translateWith(provider, texts, s);
@@ -498,6 +648,23 @@ var LyricsTranslate = (function () {
     }
   }
 
+  // Google fallback results are cached under the key of the selected provider, so the key alone does not say
+  // which service produced the text. This is the service a fresh request would use right now: without a key,
+  // translateTexts() goes straight to Google.
+  function effectiveProvider(s) {
+    const provider = PROVIDER_LABELS[s.provider] ? s.provider : "google";
+    if (provider === "google") return "google";
+    return String(s[PROVIDER_KEY_FIELD[provider]] || "").trim() ? provider : "google";
+  }
+
+  // When the lyrics are already in the target language there is nothing to translate.
+  // Chinese is excluded: the base code "zh" does not tell Simplified from Traditional.
+  function isTargetLanguage(lyricsLang, targetLang) {
+    const base = (code) => String(code || "").toLowerCase().split(/[-_]/)[0];
+    const from = base(lyricsLang);
+    return from.length >= 2 && from === base(targetLang) && from !== "zh";
+  }
+
   async function translateCurrentTrack(s, force) {
     const item = Spicetify.Player && Spicetify.Player.data && Spicetify.Player.data.item;
     if (!item || !item.uri) throw new LtError("No track is playing right now.", "NO_TRACK");
@@ -505,35 +672,120 @@ var LyricsTranslate = (function () {
     const trackId = trackIdFromUri(item.uri);
     if (!trackId) throw new LtError("Translation only works for songs.", "NOT_TRACK");
 
-    const lines = await fetchLyrics(trackId);
-    const key = cacheKey(trackId, s.provider, s.targetLang, s.sourceLang);
+    const { lines, language } = await fetchLyrics(trackId);
+    const trackName = item.name || "";
 
+    const key = cacheKey(trackId, s.provider, s.targetLang, s.sourceLang);
+    const selected = PROVIDER_LABELS[s.provider] ? s.provider : "google";
+    const wanted = effectiveProvider(s);
+    let cacheHit = null;
+    let fallbackHit = null;
     if (!force) {
       const hit = cacheRead(key, lines.length);
       if (hit) {
-        return { trackName: item.name || "", lines, translated: hit.t, provider: hit.p || "", notice: "", cached: true };
+        cacheHit = hit;
+        const cachedBy = hit.p || "";
+        // The selected provider's result stays valid even when its key was removed later: replacing it
+        // with the Google fallback would lose a better translation.
+        if (!cachedBy || cachedBy === wanted || cachedBy === selected) {
+          return { trackName, lines, translated: hit.t, provider: cachedBy, notice: "", cached: true };
+        }
+        // Cached by a fallback (Google, while the preferred provider was unavailable). Retry the preferred one below.
+        fallbackHit = hit;
       }
+    }
+
+    if (!cacheHit && isTargetLanguage(language, s.targetLang) && !force) {
+      // The notice is only shown for manual runs (loadTrack handles that), so automatic checks stay quiet.
+      return {
+        trackName,
+        lines,
+        translated: lines.map(() => ""),
+        provider: "",
+        notice: `The lyrics are already in ${langName(s.targetLang)}.`,
+        cached: false,
+      };
     }
 
     const indexes = [];
     lines.forEach((text, i) => {
       if (hasLetters(text)) indexes.push(i);
     });
-
+    const texts = indexes.map((i) => lines[i]);
     const translated = lines.map(() => "");
-    let provider = "";
-    let notice = "";
-    if (indexes.length > 0) {
-      const result = await translateTexts(indexes.map((i) => lines[i]), s);
-      result.items.forEach((text, k) => {
+    const put = (items) => {
+      items.forEach((text, k) => {
         translated[indexes[k]] = text;
       });
+    };
+
+    let provider = "";
+    let notice = "";
+    if (texts.length > 0 && fallbackHit && wanted !== "google") {
+      try {
+        put(await translateWith(wanted, texts, s));
+        provider = wanted;
+      } catch (err) {
+        // The preferred provider still fails: keep the saved fallback instead of calling Google again.
+        return {
+          trackName,
+          lines,
+          translated: fallbackHit.t,
+          provider: fallbackHit.p,
+          notice: `${PROVIDER_LABELS[wanted]} is unavailable, so the saved Google translation is shown.`,
+          cached: true,
+        };
+      }
+    } else if (texts.length > 0) {
+      const result = await translateTexts(texts, s);
+      put(result.items);
       provider = result.provider;
       notice = result.notice;
     }
 
     cacheWrite(key, lines.length, translated, provider);
-    return { trackName: item.name || "", lines, translated, provider, notice, cached: false };
+    return { trackName, lines, translated, provider, notice, cached: false };
+  }
+
+  // True when at least one lyric line is rendered on the page. Matching follows processText(), so the
+  // translation provider is only called when the injection would really find a line.
+  function lyricsOnScreen(lines) {
+    const keys = new Set();
+    const words = new Set();
+    lines.forEach((line) => {
+      if (!hasLetters(line)) return;
+      const key = norm(line);
+      keys.add(key);
+      key.split(" ").forEach((w) => {
+        if (w.length >= 2) words.add(w);
+      });
+    });
+    if (keys.size === 0) return false;
+
+    // Same filter as processText(): text inside the now-playing bar and inside interactive/structural
+    // tags is not lyrics, even when its text matches a lyric line exactly.
+    const bar = document.querySelector('[data-testid="now-playing-bar"]');
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const raw = node.nodeValue;
+      const parent = node.parentNode;
+      if (!raw || raw.length > 300 || !parent || parent.nodeType !== 1) continue;
+      const key = norm(raw);
+      if (key.length < 2) continue;
+      if (keys.has(key)) {
+        if (!skipNode(parent, bar)) return true;
+        continue;
+      }
+      if (!words.has(key)) continue;
+      for (let el = parent, d = 0; el && el.nodeType === 1 && d < 6; el = el.parentNode, d++) {
+        if (!keys.has(norm(el.textContent))) continue;
+        // Same as processText(): the first matching ancestor decides, even when it is filtered out.
+        if (!skipNode(el, bar)) return true;
+        break;
+      }
+
+    }
+    return false;
   }
 
   function buildMaps(lines, translated) {
@@ -542,6 +794,8 @@ var LyricsTranslate = (function () {
     lines.forEach((line, i) => {
       const t = translated[i];
       if (!t || !hasLetters(line)) return;
+      // A "translation" identical to the original (names, "OK", loanwords) adds nothing and would repeat the line.
+      if (norm(t) === norm(line)) return;
       const key = norm(line);
       if (!map.has(key)) map.set(key, t);
       key.split(" ").forEach((w) => {
@@ -627,19 +881,45 @@ var LyricsTranslate = (function () {
     observer = null;
   }
 
-  async function loadTrack(manual) {
+  async function loadTrack(manual, force) {
     const item = Spicetify.Player && Spicetify.Player.data && Spicetify.Player.data.item;
     const trackId = item ? trackIdFromUri(item.uri) : null;
     if (!trackId) {
       state.trackId = null;
+      state.pendingTrackId = null;
+      state.pendingSince = 0;
       state.map = null;
       state.words = null;
+      state.token++;
+      state.loading = false;
       removeInjected();
       return;
     }
-    if (state.trackId === trackId && (state.loading || state.map)) return;
-    if (!manual && state.trackId === trackId && state.failedUntil > Date.now()) return;
+    // Wakes the AI server early: Render's free plan puts it to sleep after 15 minutes without requests.
+    if (manual || state.pendingTrackId !== trackId) wakeLlm();
+    if (!force && state.trackId === trackId && (state.loading || state.map)) return;
+    if (!manual && state.failedTrackId === trackId && state.failedUntil > Date.now()) return;
 
+    if (!manual && !force) {
+      if (state.pendingTrackId !== trackId) {
+        // First sighting of a new track: drop the previous translation at once, then let the new
+        // lyrics settle before loading. Polling and songchange therefore share the same wait.
+        clearTimeout(state.pendingTimer);
+        state.pendingTimer = setTimeout(() => {
+          if (state.inline) loadTrack(false);
+        }, SONG_CHANGE_DEBOUNCE_MS + 50);
+        state.pendingTrackId = trackId;
+        state.pendingSince = Date.now();
+        state.map = null;
+        state.words = null;
+        state.token++;
+        state.loading = false;
+        removeInjected();
+      }
+      if (Date.now() - state.pendingSince < SONG_CHANGE_DEBOUNCE_MS) return;
+    }
+
+    state.pendingTrackId = trackId;
     state.trackId = trackId;
     state.map = null;
     state.words = null;
@@ -648,7 +928,14 @@ var LyricsTranslate = (function () {
     removeInjected();
 
     try {
-      const r = await translateCurrentTrack(loadSettings(), false);
+      // Automatic checks only fetch the lyrics (no translation quota) and wait until the lines are on the page.
+      // Manual runs and re-translations go straight to the translation provider.
+      if (!manual) {
+        const { lines } = await fetchLyrics(trackId);
+        if (token !== state.token) return;
+        if (!lyricsOnScreen(lines)) return;
+      }
+      const r = await translateCurrentTrack(loadSettings(), !!force);
       if (token !== state.token) return;
       state.failedUntil = 0;
       const maps = buildMaps(r.lines, r.translated);
@@ -657,7 +944,13 @@ var LyricsTranslate = (function () {
       if (manual && r.notice) notify(r.notice);
     } catch (err) {
       if (token !== state.token) return;
-      state.failedUntil = Date.now() + 5 * 60 * 1000;
+      // A failed re-translation does not start the back-off, so the next automatic check can
+      // bring the saved translation back from the cache.
+      if (!force) {
+        state.failedUntil = Date.now() + 5 * 60 * 1000;
+        state.failedTrackId = trackId;
+      }
+
       if (manual) notify(err.message || "Translation failed.", true);
     } finally {
       if (token === state.token) state.loading = false;
@@ -827,6 +1120,7 @@ var LyricsTranslate = (function () {
         ["deepl", "DeepL (API key and local proxy required)"],
         ["microsoft", "Microsoft Translator (API key and region required)"],
         ["googleCloud", "Google Cloud Translation (API key and billing required)"],
+        ["llm", "AI translation (own server: Gemini, Qwen, GPT-OSS)"],
       ],
       s.provider
     );
@@ -847,6 +1141,17 @@ var LyricsTranslate = (function () {
     const msKeyInput = textInput("password", s.msKey, "Microsoft API key");
     const msRegionInput = textInput("text", s.msRegion, "e.g. westeurope");
     const gcKeyInput = textInput("password", s.gcKey, "Google Cloud API key");
+    const llmUrlInput = textInput("text", s.llmUrl, "https://your-service.onrender.com");
+    const llmTokenInput = textInput("password", s.llmToken, "Access token");
+    const llmModelSel = select(
+      [
+        ["auto", "Auto (server order)"],
+        ["gemini", "Gemini (Google)"],
+        ["groq", "Qwen (Groq)"],
+        ["gptoss", "GPT-OSS (Groq)"],
+      ],
+      s.llmModel
+    );
     const targetSel = select(
       DEEPL_TARGET.map((code) => [code, langName(code)]),
       s.targetLang
@@ -870,6 +1175,9 @@ var LyricsTranslate = (function () {
       field("Microsoft API key", msKeyInput, el("div", "lt-note", "Create a Translator resource in Azure and copy its key.")),
       field("Microsoft region", msRegionInput, el("div", "lt-note", "The region of your resource (e.g. westeurope). Fill this in if Azure returns an error.")),
       field("Google Cloud API key", gcKeyInput, el("div", "lt-note", "Create a key in a project where you enabled the Cloud Translation API. The free quota is 500,000 characters per month; billing must be enabled on the project.")),
+      field("AI server address", llmUrlInput, el("div", "lt-note", "Address of your llm-proxy server, e.g. https://your-service.onrender.com. Leave it empty to use Google.")),
+      field("AI access token", llmTokenInput, el("div", "lt-note", "The ACCESS_TOKEN value set on the server.")),
+      field("AI model", llmModelSel, el("div", "lt-note", "Auto tries the server's models in order. Saved translations stay when you change the model; use “Re-translate this song” to refresh one.")),
       field("Target language (lyrics are translated into this language)", targetSel),
       field("Source language (auto-detect is recommended)", sourceSel),
       inlineRow
@@ -884,6 +1192,18 @@ var LyricsTranslate = (function () {
           ghost: true,
           onClick: () => notify(`${cacheClear()} translation(s) removed from the cache.`),
         },
+        {
+          label: "Re-translate this song",
+          ghost: true,
+          onClick: (close) => {
+            close();
+            if (!state.inline) {
+              notify("Turn on the translation (globe button) first.", true);
+              return;
+            }
+            loadTrack(true, true);
+          },
+        },
         { label: "Cancel", ghost: true, onClick: (close) => close() },
         {
           label: "Save",
@@ -894,6 +1214,9 @@ var LyricsTranslate = (function () {
               msKey: msKeyInput.value.trim(),
               msRegion: msRegionInput.value.trim(),
               gcKey: gcKeyInput.value.trim(),
+              llmUrl: llmUrlInput.value.trim().replace(/\/+$/, ""),
+              llmToken: llmTokenInput.value.trim(),
+              llmModel: llmModelSel.value,
               deeplProxy: (proxyInput.value.trim() || DEFAULT_PROXY).replace(/\/+$/, ""),
               targetLang: targetSel.value,
               sourceLang: sourceSel.value,
@@ -907,8 +1230,10 @@ var LyricsTranslate = (function () {
             notify("Settings saved.");
             const keyField = PROVIDER_KEY_FIELD[next.provider];
             if (keyField && !String(next[keyField] || "").trim()) {
-              notify(`${PROVIDER_LABELS[next.provider]} key is missing; translations will be done with Google.`, true);
+              const missing = next.provider === "llm" ? "server address" : "key";
+              notify(`${PROVIDER_LABELS[next.provider]} ${missing} is missing; translations will be done with Google.`, true);
             }
+
             setInline(next.inline);
           },
         },
@@ -980,6 +1305,8 @@ var LyricsTranslate = (function () {
 
     if (typeof Spicetify.Player.addEventListener === "function") {
       Spicetify.Player.addEventListener("songchange", () => {
+        // loadTrack records the first sighting of the new track and applies the settle delay itself,
+        // so repeated songchange events cannot reset or skip it.
         if (state.inline) loadTrack(false);
       });
     }
@@ -1014,6 +1341,7 @@ var LyricsTranslate = (function () {
     deeplTranslate,
     microsoftTranslate,
     googleCloudTranslate,
+    llmTranslate,
     msCode,
     decodeEntities,
     PROVIDER_LABELS,
@@ -1025,6 +1353,9 @@ var LyricsTranslate = (function () {
     alignGtx,
     trackIdFromUri,
     cacheKey,
+    lyricsOnScreen,
+    isTargetLanguage,
+    effectiveProvider,
     DEEPL_SOURCE,
     DEEPL_TARGET,
   };
