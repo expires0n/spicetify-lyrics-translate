@@ -259,6 +259,7 @@ var LyricsTranslate = (function () {
       throw new LtError("Direct lyrics request is not available.", "NO_DIRECT");
     }
     const res = await fetch(url, { headers });
+    if (res.status === 429) lyricsRetryAfterMs = (Number(res.headers.get("Retry-After")) || 0) * 1000;
     if (!res.ok) throw new LtError(`Spotify returned HTTP ${res.status}.`, "LYRICS_HTTP", res.status);
     return res.json();
   }
@@ -295,12 +296,77 @@ var LyricsTranslate = (function () {
     return new LtError(`Could not fetch lyrics: Spotify returned HTTP ${status}.`, "LYRICS_FETCH", status);
   }
 
-  // Lyrics are fetched once per track. The memo is replaced when the track changes.
-  let lyricsMemo = null;
+  // Spotify's lyrics server is shared with Spotify's own lyrics view. To keep the extension's share small,
+  // results (also "no lyrics") are kept for the last LYRICS_MEMO_MAX tracks, and after an HTTP 429 no
+  // lyrics request is sent until the pause is over. The pause is stored, so restarting Spotify keeps it.
+  const LYRICS_MEMO_MAX = 30;
+  const LYRICS_BLOCK_KEY = PREFIX + "lyricsBlock";
+  const LYRICS_FIRST_WAIT_MS = 2 * 60 * 1000;
+  const LYRICS_MAX_WAIT_MS = 30 * 60 * 1000;
+  const lyricsMemo = new Map();
+  let lyricsRetryAfterMs = 0;
+
+  function readLyricsBlock() {
+    try {
+      const block = JSON.parse(localStorage.getItem(LYRICS_BLOCK_KEY) || "null");
+      return block && typeof block.until === "number" && typeof block.wait === "number" ? block : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function writeLyricsBlock(block) {
+    try {
+      if (block) localStorage.setItem(LYRICS_BLOCK_KEY, JSON.stringify(block));
+      else localStorage.removeItem(LYRICS_BLOCK_KEY);
+    } catch (e) {}
+  }
+
+  function rememberLyrics(trackId, entry) {
+    lyricsMemo.delete(trackId);
+    lyricsMemo.set(trackId, entry);
+    while (lyricsMemo.size > LYRICS_MEMO_MAX) lyricsMemo.delete(lyricsMemo.keys().next().value);
+  }
 
   async function fetchLyrics(trackId) {
-    if (lyricsMemo && lyricsMemo.trackId === trackId) return lyricsMemo.data;
+    const hit = lyricsMemo.get(trackId);
+    if (hit) {
+      rememberLyrics(trackId, hit);
+      if (hit.error) throw hit.error;
+      return hit.data;
+    }
 
+    const now = Date.now();
+    const block = readLyricsBlock();
+    if (block && block.until > now) {
+      const minutes = Math.max(1, Math.ceil((block.until - now) / 60000));
+      throw new LtError(
+        `Spotify is rate limiting lyrics requests (HTTP 429). Lyrics requests are paused for about ${minutes} more minute(s).`,
+        "LYRICS_RATE_LIMIT",
+        429
+      );
+    }
+
+    lyricsRetryAfterMs = 0;
+    try {
+      const data = await fetchLyricsOnce(trackId);
+      writeLyricsBlock(null);
+      rememberLyrics(trackId, { data });
+      return data;
+    } catch (err) {
+      if (err && err.status === 429) {
+        // A recent pause doubles; an old one starts again from LYRICS_FIRST_WAIT_MS.
+        const recent = block && now - block.until < LYRICS_MAX_WAIT_MS;
+        const wait = Math.min(LYRICS_MAX_WAIT_MS, Math.max(lyricsRetryAfterMs, recent ? block.wait * 2 : LYRICS_FIRST_WAIT_MS));
+        writeLyricsBlock({ until: now + wait, wait });
+      } else if (err && err.code === "NO_LYRICS") {
+        rememberLyrics(trackId, { error: err });
+      }
+      throw err;
+    }
+  }
+
+  async function fetchLyricsOnce(trackId) {
     const url = `${LYRICS_ENDPOINT}${trackId}?format=json&vocalRemoval=false&market=from_token`;
     let body;
     let directErr = null;
@@ -336,7 +402,6 @@ var LyricsTranslate = (function () {
       language: typeof lyrics.language === "string" ? lyrics.language : "",
       isRtlLanguage: !!lyrics.isRtlLanguage,
     };
-    lyricsMemo = { trackId, data };
     return data;
   }
 
