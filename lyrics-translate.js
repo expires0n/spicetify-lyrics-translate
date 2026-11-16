@@ -1,6 +1,21 @@
 // NAME: Lyrics Translate
 // DESCRIPTION: Adds translations below Spotify lyrics using Google Translate, DeepL, Microsoft Translator, Google Cloud Translation or a self-hosted AI server. Globe button: left-click toggles the translation, right-click opens the settings.
-// VERSION: 2.0.0
+// VERSION: 2.1.0
+//
+// PERFORMANCE NOTES (2.1.0 "low-footprint" rewrite):
+// - No fixed polling loops. Work is event-driven: songchange + History.listen + a MutationObserver
+//   scoped to the lyrics container only (never document.body). A single adaptive heartbeat remains
+//   as a cheap safety net and does zero DOM walks when idle.
+// - DOM mutations are coalesced into one batched scan per ~120ms; huge re-renders collapse into a
+//   single container-scoped walk.
+// - norm() has a fast path (skips regex replaces for plain text) plus a bounded memo cache.
+// - Injected elements are tracked in a Set: cleanup is O(injected), not a document-wide query.
+// - Settings are parsed once and kept in memory.
+// - Window hidden / lyrics view closed / translation off => observer detached, timers stopped.
+// - Automatic mode does not even fetch lyrics while the lyrics view is closed.
+// - Repeated lines (choruses) are deduplicated before hitting the translation provider.
+// - All provider fetches have timeouts so a hung request can never wedge the extension.
+// - The playbar button is placed via a childList-only observer on the playbar, not a 2s interval.
 
 var LyricsTranslate = (function () {
   "use strict";
@@ -13,8 +28,22 @@ var LyricsTranslate = (function () {
   const STYLE_ID = "lyricsTranslate-style";
   const INLINE_ATTR = "data-lt-tr";
   const INIT_RETRY_LIMIT = 100;
-  const POLL_MS = 2500;
   const SONG_CHANGE_DEBOUNCE_MS = 1500;
+
+  // Scheduler tuning. The heartbeat never walks the DOM; it only checks a few element references.
+  const SCAN_BATCH_MS = 120;
+  const SCREEN_CHECK_MS = 600;
+  const PLACEMENT_DEBOUNCE_MS = 250;
+  const PLACEMENT_SAFETY_MS = 5000;
+  const HEARTBEAT_ACTIVE_MS = 1500;
+  const HEARTBEAT_IDLE_MS = 6000;
+  const HEARTBEAT_NO_VIEW_MS = 3000;
+  const HEARTBEAT_HIDDEN_MS = 20000;
+  const FETCH_TIMEOUT_MS = 20000;
+  const NORM_CACHE_MAX = 2000;
+  const MAX_TEXT_LEN = 300;
+  const MAX_ANCESTOR_LEN = 1000;
+  const SCAN_NODE_BURST = 300;
 
   const DEFAULT_PROXY = "http://127.0.0.1:8787";
   const GTX_ENDPOINT = "https://translate.googleapis.com/translate_a/single";
@@ -30,6 +59,10 @@ var LyricsTranslate = (function () {
   const LLM_TIMEOUT_MS = 60 * 1000;
   const LLM_WAKE_MS = 5 * 60 * 1000;
 
+  // Known lyrics roots. If none match (Spotify redesign), the /lyrics route falls back to the main
+  // view, which still excludes the playbar and sidebars. injectNow() keeps a one-shot body fallback.
+  const CONTAINER_SELECTOR =
+    '.lyrics-lyricsContainer-LyricsContainer,.lyrics-lyrics-container,[data-testid="lyrics-container"],[data-testid="lyrics-page"],.Root__lyrics-cinema';
 
   const LINKS = {
     deeplSignup: "https://www.deepl.com/pro-api",
@@ -57,7 +90,6 @@ var LyricsTranslate = (function () {
   const DEEPL_TARGET = ["AR", "BG", "CS", "DA", "DE", "EL", "EN-GB", "EN-US", "ES", "ET", "FI", "FR", "HU", "ID", "IT", "JA", "KO", "LT", "LV", "NB", "NL", "PL", "PT-BR", "PT-PT", "RO", "RU", "SK", "SL", "SV", "TR", "UK", "ZH"];
 
   const GOOGLE_CODE_MAP = { EN: "en", "EN-GB": "en", "EN-US": "en", PT: "pt", "PT-BR": "pt", "PT-PT": "pt", ZH: "zh-CN", NB: "no" };
-
   const MS_CODE_MAP = { "EN-GB": "en", "EN-US": "en", PT: "pt", "PT-BR": "pt", "PT-PT": "pt-pt", ZH: "zh-Hans" };
 
   const ICON =
@@ -85,7 +117,28 @@ var LyricsTranslate = (function () {
   let buttonRef = null;
   let initAttempts = 0;
   let namesCache = null;
-  let observer = null;
+  let settingsCache = null;
+
+  // DOM engine references. Everything here is either connected-checkable or bounded in size.
+  let containerRef = null;
+  let containerObserver = null;
+  let barRef = null;
+  let playbarRef = null;
+  let placementObserver = null;
+  let placementTimer = null;
+  let micRef = null;
+  let heartbeatTimer = null;
+  let wasHidden = false;
+  let scanTimer = null;
+  let scanFull = false;
+  let screenCheckTimer = null;
+  let lastScreenCheck = 0;
+  let screenPrep = null;
+  let pokeTimers = [];
+  const pendingNodes = new Set();
+  const injected = new Set();
+  const normCache = new Map();
+
   const state = { inline: false, trackId: null, token: 0, loading: false, map: null, words: null, pendingTrackId: null, pendingSince: 0, failedUntil: 0, failedTrackId: null, pendingTimer: null };
 
   class LtError extends Error {
@@ -135,14 +188,46 @@ var LyricsTranslate = (function () {
 
   const hasLetters = (text) => /\p{L}/u.test(text);
 
-  const norm = (s) =>
-    String(s)
-      .replace(/[\u00a0\u2000-\u200b\u202f\u3000]/g, " ")
-      .replace(/[\u2018\u2019\u2032`\u00b4]/g, "'")
-      .replace(/[\u201c\u201d]/g, '"')
-      .replace(/\s+/g, " ")
-      .trim()
-      .toLowerCase();
+  // Same normalization as before, but plain ASCII text skips every replace() and results are memoized.
+  const NORM_SPECIAL = /[\u00a0\u2000-\u200b\u202f\u3000\u2018\u2019\u2032`\u00b4\u201c\u201d]/;
+  const NORM_SPACES_G = /[\u00a0\u2000-\u200b\u202f\u3000]/g;
+  const NORM_SQUOTES_G = /[\u2018\u2019\u2032`\u00b4]/g;
+  const NORM_DQUOTES_G = /[\u201c\u201d]/g;
+  const NORM_WS_TEST = /[\n\r\t\v\f]|\s\s/;
+  const NORM_WS_G = /\s+/g;
+
+  function norm(s) {
+    const str = String(s);
+    const hit = normCache.get(str);
+    if (hit !== undefined) return hit;
+    let out = str;
+    if (NORM_SPECIAL.test(out)) {
+      out = out.replace(NORM_SPACES_G, " ").replace(NORM_SQUOTES_G, "'").replace(NORM_DQUOTES_G, '"');
+    }
+    if (NORM_WS_TEST.test(out)) out = out.replace(NORM_WS_G, " ");
+    out = out.trim().toLowerCase();
+    if (normCache.size >= NORM_CACHE_MAX) normCache.clear();
+    normCache.set(str, out);
+    return out;
+  }
+
+  // Repeated lines (choruses) are sent to the provider once; "back" maps every line to its unique index.
+  function dedupeTexts(texts) {
+    const uniq = [];
+    const index = new Map();
+    const back = [];
+    for (const t of texts) {
+      const k = norm(t);
+      let i = index.get(k);
+      if (i === undefined) {
+        i = uniq.length;
+        index.set(k, i);
+        uniq.push(t);
+      }
+      back.push(i);
+    }
+    return { uniq, back };
+  }
 
   const langName = (code) => {
     if (!code || code === "auto") return "Auto-detect";
@@ -186,17 +271,22 @@ var LyricsTranslate = (function () {
     },
   };
 
+  // Settings are parsed once per session; saveSettings keeps the memory copy in sync.
   function loadSettings() {
-    let saved = {};
-    try {
-      saved = JSON.parse(store.get(SETTINGS_KEY) || "{}") || {};
-    } catch (e) {
-      saved = {};
+    if (!settingsCache) {
+      try {
+        settingsCache = JSON.parse(store.get(SETTINGS_KEY) || "{}") || {};
+      } catch (e) {
+        settingsCache = {};
+      }
     }
-    return Object.assign({}, DEFAULTS, saved);
+    return Object.assign({}, DEFAULTS, settingsCache);
   }
 
-  const saveSettings = (settings) => store.set(SETTINGS_KEY, JSON.stringify(settings));
+  function saveSettings(settings) {
+    settingsCache = Object.assign({}, settings);
+    return store.set(SETTINGS_KEY, JSON.stringify(settings));
+  }
 
   const cacheKey = (trackId, provider, targetLang, sourceLang) =>
     `${PREFIX}cache:${trackId}:${provider}:${targetLang}:${sourceLang}`;
@@ -234,6 +324,17 @@ var LyricsTranslate = (function () {
     return index.length;
   }
 
+  // Every network call gets a timeout so a hung request cannot leave the extension "loading" forever.
+  async function fetchTimed(url, options, ms) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms || FETCH_TIMEOUT_MS);
+    try {
+      return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // Spicetify 2.45.0 routes spclient URLs to Spotify's native resolver when the Spotify client is 1.3.x,
   // which fails with "Resolver not found!" (see PR #1). So the lyrics request is sent with fetch first, using
   // the token and headers Spicetify's own CosmosAsync wrapper injects for spclient URLs
@@ -258,7 +359,7 @@ var LyricsTranslate = (function () {
     if (!headers || typeof fetch !== "function") {
       throw new LtError("Direct lyrics request is not available.", "NO_DIRECT");
     }
-    const res = await fetch(url, { headers });
+    const res = await fetchTimed(url, { headers });
     if (res.status === 429) lyricsRetryAfterMs = (Number(res.headers.get("Retry-After")) || 0) * 1000;
     if (!res.ok) throw new LtError(`Spotify returned HTTP ${res.status}.`, "LYRICS_HTTP", res.status);
     return res.json();
@@ -283,7 +384,7 @@ var LyricsTranslate = (function () {
       return new LtError(
         "Could not fetch lyrics: Spotify is rate limiting requests (HTTP 429). Try again later.",
         "LYRICS_RATE_LIMIT",
-        status
+        429
       );
     }
     if (status >= 500) {
@@ -384,7 +485,7 @@ var LyricsTranslate = (function () {
         body = await Spicetify.CosmosAsync.get(url, undefined, { "app-platform": "WebPlayer" });
       } catch (err) {
         const cosmosStatus = err && (err.status || err.code);
-              if (typeof cosmosStatus === "number" && cosmosStatus >= 400) throw lyricsStatusError(cosmosStatus);
+        if (typeof cosmosStatus === "number" && cosmosStatus >= 400) throw lyricsStatusError(cosmosStatus);
         throw new LtError("Could not fetch lyrics: " + ((err && err.message) || "unknown error"), "LYRICS_FETCH");
       }
     }
@@ -398,7 +499,6 @@ var LyricsTranslate = (function () {
 
     const data = {
       lines: lines.map((line) => (line && typeof line.words === "string" ? line.words.trim() : "")),
-      // Field names are NOT verified against a live response. If they are missing, the language skip never triggers.
       language: typeof lyrics.language === "string" ? lyrics.language : "",
       isRtlLanguage: !!lyrics.isRtlLanguage,
     };
@@ -456,7 +556,7 @@ var LyricsTranslate = (function () {
     for (let attempt = 0; attempt < 3; attempt++) {
       let res;
       try {
-        res = await fetch(url, { method: "POST", body: new URLSearchParams({ q: text }) });
+        res = await fetchTimed(url, { method: "POST", body: new URLSearchParams({ q: text }) });
       } catch (err) {
         throw new LtError("Could not reach Google: " + err.message, "NETWORK");
       }
@@ -521,7 +621,7 @@ var LyricsTranslate = (function () {
 
       let res;
       try {
-        res = await fetch(`${base}/v2/translate`, {
+        res = await fetchTimed(`${base}/v2/translate`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -566,7 +666,7 @@ var LyricsTranslate = (function () {
     for (const batch of batchByLimits(lines, MS_MAX_LINES, MS_MAX_CHARS)) {
       let res;
       try {
-        res = await fetch(url, { method: "POST", headers, body: JSON.stringify(batch.map((Text) => ({ Text }))) });
+        res = await fetchTimed(url, { method: "POST", headers, body: JSON.stringify(batch.map((Text) => ({ Text }))) });
       } catch (err) {
         throw new LtError("Could not reach Microsoft Translator.", "NETWORK");
       }
@@ -605,7 +705,7 @@ var LyricsTranslate = (function () {
     for (const batch of batchByLimits(lines, GCLOUD_MAX_LINES, GCLOUD_MAX_CHARS)) {
       let res;
       try {
-        res = await fetch(url, {
+        res = await fetchTimed(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(Object.assign({}, base, { q: batch })),
@@ -701,7 +801,7 @@ var LyricsTranslate = (function () {
     const label = PROVIDER_LABELS[provider];
     if (!String(s[PROVIDER_KEY_FIELD[provider]] || "").trim()) {
       const items = await googleTranslate(texts, s);
-       const missing = provider === "llm" ? "server address" : "key";
+      const missing = provider === "llm" ? "server address" : "key";
       return { items, provider: "google", notice: `${label} ${missing} is not set, so it was translated with Google.` };
     }
     try {
@@ -778,9 +878,11 @@ var LyricsTranslate = (function () {
     });
     const texts = indexes.map((i) => lines[i]);
     const translated = lines.map(() => "");
+    // Choruses repeat: translate each unique line once, then fan the result back out.
+    const { uniq, back } = dedupeTexts(texts);
     const put = (items) => {
-      items.forEach((text, k) => {
-        translated[indexes[k]] = text;
+      back.forEach((u, k) => {
+        translated[indexes[k]] = items[u];
       });
     };
 
@@ -788,7 +890,7 @@ var LyricsTranslate = (function () {
     let notice = "";
     if (texts.length > 0 && fallbackHit && wanted !== "google") {
       try {
-        put(await translateWith(wanted, texts, s));
+        put(await translateWith(wanted, uniq, s));
         provider = wanted;
       } catch (err) {
         // The preferred provider still fails: keep the saved fallback instead of calling Google again.
@@ -802,7 +904,7 @@ var LyricsTranslate = (function () {
         };
       }
     } else if (texts.length > 0) {
-      const result = await translateTexts(texts, s);
+      const result = await translateTexts(uniq, s);
       put(result.items);
       provider = result.provider;
       notice = result.notice;
@@ -812,9 +914,131 @@ var LyricsTranslate = (function () {
     return { trackName, lines, translated, provider, notice, cached: false };
   }
 
-  // True when at least one lyric line is rendered on the page. Matching follows processText(), so the
-  // translation provider is only called when the injection would really find a line.
-  function lyricsOnScreen(lines) {
+  const SKIP_TAGS = { A: 1, BUTTON: 1, H1: 1, H2: 1, H3: 1, H4: 1, NAV: 1, HEADER: 1, FOOTER: 1, SELECT: 1, OPTION: 1, INPUT: 1, TEXTAREA: 1, SCRIPT: 1, STYLE: 1 };
+
+  function skipNode(el, bar) {
+    if (bar && bar.contains(el)) return true;
+    for (let a = el, d = 0; a && a.nodeType === 1 && d < 3; a = a.parentNode, d++) {
+      if (SKIP_TAGS[a.tagName]) return true;
+    }
+    return false;
+  }
+
+  function nowPlayingBar() {
+    if (barRef && barRef.isConnected) return barRef;
+    barRef = document.querySelector('[data-testid="now-playing-bar"]');
+    return barRef;
+  }
+
+  function lyricsRoute() {
+    try {
+      const loc = Spicetify.Platform.History.location;
+      return !!loc && /^\/lyrics/.test(String(loc.pathname || ""));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function findLyricsContainer() {
+    const el = document.querySelector(CONTAINER_SELECTOR);
+    if (el) return el;
+    if (lyricsRoute()) return document.querySelector(".Root__main-view");
+    return null;
+  }
+
+  // The observer only ever watches the lyrics container. No container (view closed) => no observer,
+  // no scans, no lyrics requests. The playbar's constant updates never reach this code.
+  function attachContainerObserver() {
+    if (typeof MutationObserver === "undefined" || !containerRef) return;
+    if (!containerObserver) containerObserver = new MutationObserver(onContainerMutations);
+    containerObserver.disconnect();
+    if (document.hidden) return;
+    containerObserver.observe(containerRef, { childList: true, subtree: true, characterData: true });
+  }
+
+  function detachContainerObserver() {
+    if (containerObserver) containerObserver.disconnect();
+  }
+
+  function ensureContainer(force) {
+    const valid = containerRef && containerRef.isConnected;
+    if (valid && !force) return containerRef;
+    const found = valid ? containerRef : findLyricsContainer();
+    const changed = found !== containerRef;
+    containerRef = found;
+    if (found) {
+      attachContainerObserver();
+      if (changed || force) {
+        if (state.map) requestScan(true);
+        scheduleScreenCheck();
+      }
+    } else {
+      detachContainerObserver();
+    }
+    return found;
+  }
+
+  function onContainerMutations(mutations) {
+    if (document.hidden || !state.inline) return;
+    if (!state.map) {
+      // Lyrics may just have rendered: re-check (throttled) whether translation can start.
+      scheduleScreenCheck();
+      return;
+    }
+    for (const m of mutations) {
+      if (m.type === "characterData") pendingNodes.add(m.target);
+      else for (const n of m.addedNodes) pendingNodes.add(n);
+    }
+    if (pendingNodes.size) requestScan(false);
+  }
+
+  // Mutations are coalesced: one scan per SCAN_BATCH_MS at most, over the changed nodes only.
+  function requestScan(full) {
+    if (full) {
+      pendingNodes.clear();
+      scanFull = true;
+    }
+    if (scanTimer) return;
+    scanTimer = setTimeout(flushScan, SCAN_BATCH_MS);
+  }
+
+  function flushScan() {
+    scanTimer = null;
+    const full = scanFull;
+    scanFull = false;
+    if (!state.inline || !state.map || document.hidden) {
+      pendingNodes.clear();
+      return;
+    }
+    const scope = containerRef && containerRef.isConnected ? containerRef : null;
+    if (full || !scope || pendingNodes.size > SCAN_NODE_BURST) {
+      pendingNodes.clear();
+      // Inside the lyrics container the playbar can never appear, so the bar filter is unnecessary.
+      scanSubtree(scope || document.body, scope ? null : nowPlayingBar());
+      return;
+    }
+    const nodes = Array.from(pendingNodes);
+    pendingNodes.clear();
+    for (const n of nodes) {
+      if (!n.isConnected) continue;
+      if (n.nodeType === 3) processText(n, null);
+      else if (n.nodeType === 1) scanSubtree(n, null);
+    }
+  }
+
+  function scheduleScreenCheck() {
+    if (!state.inline || state.map || state.loading || screenCheckTimer) return;
+    const wait = Math.max(0, SCREEN_CHECK_MS - (Date.now() - lastScreenCheck));
+    screenCheckTimer = setTimeout(() => {
+      screenCheckTimer = null;
+      lastScreenCheck = Date.now();
+      if (state.inline && !state.map && !state.loading && !document.hidden) loadTrack(false);
+    }, wait);
+  }
+
+  // The key/word sets are built once per lyrics array (memoized per track), not on every check.
+  function screenPrepFor(lines) {
+    if (screenPrep && screenPrep.lines === lines) return screenPrep;
     const keys = new Set();
     const words = new Set();
     lines.forEach((line) => {
@@ -825,30 +1049,36 @@ var LyricsTranslate = (function () {
         if (w.length >= 2) words.add(w);
       });
     });
-    if (keys.size === 0) return false;
+    screenPrep = { lines, keys, words };
+    return screenPrep;
+  }
 
-    // Same filter as processText(): text inside the now-playing bar and inside interactive/structural
-    // tags is not lyrics, even when its text matches a lyric line exactly.
-    const bar = document.querySelector('[data-testid="now-playing-bar"]');
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  // True when at least one lyric line is rendered. Scoped to the lyrics container when available.
+  function lyricsOnScreen(lines) {
+    const prep = screenPrepFor(lines);
+    if (prep.keys.size === 0) return false;
+    const scope = containerRef && containerRef.isConnected ? containerRef : document.body;
+    const bar = scope === document.body ? nowPlayingBar() : null;
+    const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
       const raw = node.nodeValue;
       const parent = node.parentNode;
-      if (!raw || raw.length > 300 || !parent || parent.nodeType !== 1) continue;
+      if (!raw || raw.length > MAX_TEXT_LEN || !parent || parent.nodeType !== 1) continue;
       const key = norm(raw);
       if (key.length < 2) continue;
-      if (keys.has(key)) {
+      if (prep.keys.has(key)) {
         if (!skipNode(parent, bar)) return true;
         continue;
       }
-      if (!words.has(key)) continue;
+      if (!prep.words.has(key)) continue;
       for (let el = parent, d = 0; el && el.nodeType === 1 && d < 6; el = el.parentNode, d++) {
-        if (!keys.has(norm(el.textContent))) continue;
+        const text = el.textContent || "";
+        if (text.length > MAX_ANCESTOR_LEN) continue;
+        if (!prep.keys.has(norm(text))) continue;
         // Same as processText(): the first matching ancestor decides, even when it is filtered out.
         if (!skipNode(el, bar)) return true;
         break;
       }
-
     }
     return false;
   }
@@ -870,25 +1100,17 @@ var LyricsTranslate = (function () {
     return { map, words };
   }
 
-  const SKIP_TAGS = { A: 1, BUTTON: 1, H1: 1, H2: 1, H3: 1, H4: 1, NAV: 1, HEADER: 1, FOOTER: 1, SELECT: 1, OPTION: 1, INPUT: 1, TEXTAREA: 1, SCRIPT: 1, STYLE: 1 };
-
-  function skipNode(el, bar) {
-    if (bar && bar.contains(el)) return true;
-    for (let a = el, d = 0; a && a.nodeType === 1 && d < 3; a = a.parentNode, d++) {
-      if (SKIP_TAGS[a.tagName]) return true;
-    }
-    return false;
-  }
-
   function applyTo(el, key) {
     const text = state.map.get(key);
-    if (text && el.getAttribute(INLINE_ATTR) !== text) el.setAttribute(INLINE_ATTR, text);
+    if (!text) return;
+    if (el.getAttribute(INLINE_ATTR) !== text) el.setAttribute(INLINE_ATTR, text);
+    injected.add(el);
   }
 
   function processText(node, bar) {
     const parent = node.parentNode;
     const raw = node.nodeValue;
-    if (!parent || parent.nodeType !== 1 || !raw || raw.length > 300) return;
+    if (!parent || parent.nodeType !== 1 || !raw || raw.length > MAX_TEXT_LEN) return;
     const key = norm(raw);
     if (key.length < 2) return;
     if (state.map.has(key)) {
@@ -897,7 +1119,9 @@ var LyricsTranslate = (function () {
     }
     if (!state.words.has(key)) return;
     for (let el = parent, d = 0; el && el.nodeType === 1 && d < 6; el = el.parentNode, d++) {
-      const full = norm(el.textContent);
+      const text = el.textContent || "";
+      if (text.length > MAX_ANCESTOR_LEN) continue;
+      const full = norm(text);
       if (state.map.has(full)) {
         if (!skipNode(el, bar)) applyTo(el, full);
         return;
@@ -912,8 +1136,13 @@ var LyricsTranslate = (function () {
     for (let node = walker.nextNode(); node; node = walker.nextNode()) processText(node, bar);
   }
 
+  // Cleanup is O(injected elements); no document-wide attribute query is needed anymore.
   function removeInjected() {
-    document.querySelectorAll("[" + INLINE_ATTR + "]").forEach((n) => n.removeAttribute(INLINE_ATTR));
+    if (!injected.size) return;
+    injected.forEach((el) => {
+      if (el.isConnected) el.removeAttribute(INLINE_ATTR);
+    });
+    injected.clear();
   }
 
   function injectNow() {
@@ -921,29 +1150,8 @@ var LyricsTranslate = (function () {
       removeInjected();
       return;
     }
-    scanSubtree(document.body, document.querySelector('[data-testid="now-playing-bar"]'));
-  }
-
-  function scheduleInject() {
-    injectNow();
-  }
-
-  function startObserver() {
-    if (observer || typeof MutationObserver === "undefined") return;
-    observer = new MutationObserver((mutations) => {
-      if (!state.inline || !state.map) return;
-      const bar = document.querySelector('[data-testid="now-playing-bar"]');
-      mutations.forEach((m) => {
-        if (m.type === "characterData") processText(m.target, bar);
-        m.addedNodes.forEach((n) => scanSubtree(n, bar));
-      });
-    });
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-  }
-
-  function stopObserver() {
-    if (observer) observer.disconnect();
-    observer = null;
+    const scope = containerRef && containerRef.isConnected ? containerRef : null;
+    scanSubtree(scope || document.body, scope ? null : nowPlayingBar());
   }
 
   async function loadTrack(manual, force) {
@@ -968,10 +1176,10 @@ var LyricsTranslate = (function () {
     if (!manual && !force) {
       if (state.pendingTrackId !== trackId) {
         // First sighting of a new track: drop the previous translation at once, then let the new
-        // lyrics settle before loading. Polling and songchange therefore share the same wait.
+        // lyrics settle before loading. Events and the heartbeat therefore share the same wait.
         clearTimeout(state.pendingTimer);
         state.pendingTimer = setTimeout(() => {
-          if (state.inline) loadTrack(false);
+          if (state.inline && !document.hidden) loadTrack(false);
         }, SONG_CHANGE_DEBOUNCE_MS + 50);
         state.pendingTrackId = trackId;
         state.pendingSince = Date.now();
@@ -979,9 +1187,13 @@ var LyricsTranslate = (function () {
         state.words = null;
         state.token++;
         state.loading = false;
+        screenPrep = null;
+        normCache.clear();
         removeInjected();
       }
       if (Date.now() - state.pendingSince < SONG_CHANGE_DEBOUNCE_MS) return;
+      // Lyrics view closed: nothing can be rendered, so no lyrics request is sent either.
+      if (!ensureContainer(false)) return;
     }
 
     state.pendingTrackId = trackId;
@@ -1015,12 +1227,69 @@ var LyricsTranslate = (function () {
         state.failedUntil = Date.now() + 5 * 60 * 1000;
         state.failedTrackId = trackId;
       }
-
       if (manual) notify(err.message || "Translation failed.", true);
     } finally {
-      if (token === state.token) state.loading = false;
-      scheduleInject();
+      if (token === state.token) {
+        state.loading = false;
+        if (state.map) requestScan(true);
+      }
     }
+  }
+
+  // One adaptive safety-net timer. Idle ticks only check element references (isConnected, track id);
+  // they never walk the DOM. Real work is triggered by songchange, History, and the scoped observer.
+  function heartbeatDelay() {
+    if (!(containerRef && containerRef.isConnected)) return HEARTBEAT_NO_VIEW_MS;
+    if (state.failedUntil > Date.now() || !state.pendingTrackId) return HEARTBEAT_IDLE_MS;
+    if (state.loading || !state.map) return HEARTBEAT_ACTIVE_MS;
+    return HEARTBEAT_IDLE_MS;
+  }
+
+  function scheduleHeartbeat() {
+    if (heartbeatTimer || !state.inline) return;
+    heartbeatTimer = setTimeout(heartbeat, document.hidden ? HEARTBEAT_HIDDEN_MS : heartbeatDelay());
+  }
+
+  function heartbeat() {
+    heartbeatTimer = null;
+    if (!state.inline) return;
+    if (document.hidden) {
+      // Hidden window: keep only a 20s no-op pulse so the extension can self-heal on wake.
+      wasHidden = true;
+      heartbeatTimer = setTimeout(heartbeat, HEARTBEAT_HIDDEN_MS);
+      return;
+    }
+    const woke = wasHidden;
+    wasHidden = false;
+    ensureContainer(woke);
+    ensurePlacementObserver();
+    loadTrack(false);
+    scheduleHeartbeat();
+  }
+
+  function stopHeartbeat() {
+    clearTimeout(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+
+  function stopScan() {
+    clearTimeout(scanTimer);
+    scanTimer = null;
+    scanFull = false;
+    pendingNodes.clear();
+  }
+
+  // Route changes render asynchronously; check now and shortly after. Bounded, cheap pokes.
+  function pokeSoon() {
+    pokeTimers.forEach(clearTimeout);
+    pokeTimers = [];
+    [0, 300, 900].forEach((d) => {
+      pokeTimers.push(setTimeout(() => {
+        if (!state.inline || document.hidden) return;
+        ensureContainer(false);
+        loadTrack(false);
+      }, d));
+    });
   }
 
   function setInline(on, manual) {
@@ -1031,14 +1300,24 @@ var LyricsTranslate = (function () {
     if (buttonRef) buttonRef.active = state.inline;
 
     if (state.inline) {
-      startObserver();
+      ensureContainer(true);
       loadTrack(manual !== false);
-      scheduleInject();
+      scheduleHeartbeat();
     } else {
-      stopObserver();
+      stopHeartbeat();
+      stopScan();
+      clearTimeout(state.pendingTimer);
+      clearTimeout(screenCheckTimer);
+      screenCheckTimer = null;
+      detachContainerObserver();
+      containerRef = null;
       state.trackId = null;
+      state.pendingTrackId = null;
+      state.pendingSince = 0;
       state.map = null;
       state.words = null;
+      state.token++;
+      state.loading = false;
       removeInjected();
     }
   }
@@ -1308,7 +1587,7 @@ var LyricsTranslate = (function () {
 
   function findLyricsButton() {
     const ours = buttonRef && buttonRef.element;
-    const scope = (ours && ours.parentNode) || document.querySelector('[data-testid="now-playing-bar"]');
+    const scope = (ours && ours.parentNode) || nowPlayingBar();
     if (!scope) return null;
 
     const exact = scope.querySelector('button[data-testid*="lyric" i]');
@@ -1326,11 +1605,46 @@ var LyricsTranslate = (function () {
 
   function placeNextToLyrics() {
     if (!buttonRef || !buttonRef.element) return;
+    const ours = buttonRef.element;
+    // Fast path: already in the right spot -> a few property reads, no queries.
+    if (ours.isConnected && micRef && micRef.isConnected && micRef.nextElementSibling === ours) return;
     const mic = findLyricsButton();
     if (!mic || !mic.parentNode) return;
-    const ours = buttonRef.element;
+    micRef = mic;
     if (mic.nextElementSibling === ours) return;
     mic.parentNode.insertBefore(ours, mic.nextSibling);
+  }
+
+  // childList-only observer on the playbar: progress/time updates (characterData, attributes) never
+  // fire it. Replaces the old unconditional 2-second interval.
+  function ensurePlacementObserver() {
+    if (placementObserver && playbarRef && playbarRef.isConnected) return;
+    const bar = nowPlayingBar();
+    if (!bar) return;
+    playbarRef = bar;
+    if (!placementObserver && typeof MutationObserver !== "undefined") {
+      placementObserver = new MutationObserver(() => {
+        if (placementTimer) return;
+        placementTimer = setTimeout(() => {
+          placementTimer = null;
+          placeNextToLyrics();
+        }, PLACEMENT_DEBOUNCE_MS);
+      });
+    }
+    if (placementObserver) {
+      placementObserver.disconnect();
+      placementObserver.observe(bar, { childList: true, subtree: true });
+    }
+    placeNextToLyrics();
+  }
+
+  // Ultra-cheap always-on safety tick for button placement only (works even when translation is off).
+  function placementTick() {
+    if (!document.hidden) {
+      ensurePlacementObserver();
+      placeNextToLyrics();
+    }
+    setTimeout(placementTick, PLACEMENT_SAFETY_MS);
   }
 
   function init() {
@@ -1349,6 +1663,8 @@ var LyricsTranslate = (function () {
     if (buttonRef) return;
 
     injectStyle();
+    // One-time sweep for attributes left behind by an older version (hot reload).
+    document.querySelectorAll("[" + INLINE_ATTR + "]").forEach((n) => n.removeAttribute(INLINE_ATTR));
     state.inline = !!loadSettings().inline;
     buttonRef = new Spicetify.Playbar.Button(
       "Lyrics translation (left-click: on/off · right-click: settings)",
@@ -1372,20 +1688,42 @@ var LyricsTranslate = (function () {
       Spicetify.Player.addEventListener("songchange", () => {
         // loadTrack records the first sighting of the new track and applies the settle delay itself,
         // so repeated songchange events cannot reset or skip it.
-        if (state.inline) loadTrack(false);
+        if (state.inline && !document.hidden) loadTrack(false);
       });
     }
-    setInterval(() => {
-      if (state.inline) loadTrack(false);
-      scheduleInject();
-    }, POLL_MS);
-    setInterval(placeNextToLyrics, 2000);
 
-    placeNextToLyrics();
+    // Navigation events replace most of the old polling: opening/closing the lyrics page is detected
+    // immediately instead of waiting for the next poll tick.
+    try {
+      const history = Spicetify.Platform && Spicetify.Platform.History;
+      if (history && typeof history.listen === "function") {
+        history.listen(() => {
+          if (state.inline && !document.hidden) pokeSoon();
+        });
+      }
+    } catch (e) {}
+
+    // Hidden window (minimized/other virtual desktop): stop the observer and all timers.
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        detachContainerObserver();
+        stopScan();
+      } else {
+        if (state.inline) {
+          ensureContainer(true);
+          loadTrack(false);
+          scheduleHeartbeat();
+        }
+        placeNextToLyrics();
+      }
+    });
+
+    setTimeout(placementTick, PLACEMENT_SAFETY_MS);
+    ensurePlacementObserver();
     if (state.inline) {
-      startObserver();
+      ensureContainer(true);
       loadTrack(false);
-      scheduleInject();
+      scheduleHeartbeat();
     }
   }
 
@@ -1421,6 +1759,7 @@ var LyricsTranslate = (function () {
     lyricsOnScreen,
     isTargetLanguage,
     effectiveProvider,
+    dedupeTexts,
     DEEPL_SOURCE,
     DEEPL_TARGET,
   };
