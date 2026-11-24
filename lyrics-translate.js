@@ -1,5 +1,5 @@
 // NAME: Lyrics Translate
-// DESCRIPTION: Adds translations below Spotify lyrics using Google Translate, DeepL, Microsoft Translator, Google Cloud Translation or a self-hosted AI server. Globe button: left-click toggles the translation, right-click opens the settings.
+// DESCRIPTION: Adds translations below Spotify lyrics using Google Translate, DeepL or a self-hosted AI server. Globe button: left-click toggles the translation, right-click opens the settings.
 // VERSION: 2.0.0
 
 var LyricsTranslate = (function () {
@@ -18,14 +18,10 @@ var LyricsTranslate = (function () {
 
   const DEFAULT_PROXY = "http://127.0.0.1:8787";
   const GTX_ENDPOINT = "https://translate.googleapis.com/translate_a/single";
-  const GTX_MAX_LINES = 30;
-  const GTX_MAX_CHARS = 1500;
-  const MS_ENDPOINT = "https://api.cognitive.microsofttranslator.com/translate";
-  const MS_MAX_LINES = 50;
-  const MS_MAX_CHARS = 40000;
-  const GCLOUD_ENDPOINT = "https://translation.googleapis.com/language/translate/v2";
-  const GCLOUD_MAX_LINES = 50;
-  const GCLOUD_MAX_CHARS = 5000;
+  // The text goes in a POST body, so a whole song usually fits in one request. Fewer requests
+  // means Google's rate limit is hit far less often.
+  const GTX_MAX_LINES = 120;
+  const GTX_MAX_CHARS = 5000;
   const LYRICS_ENDPOINT = "https://spclient.wg.spotify.com/color-lyrics/v2/track/";
   const LLM_TIMEOUT_MS = 60 * 1000;
   const LLM_WAKE_MS = 5 * 60 * 1000;
@@ -41,9 +37,6 @@ var LyricsTranslate = (function () {
     provider: "google",
     deeplKey: "",
     deeplProxy: DEFAULT_PROXY,
-    msKey: "",
-    msRegion: "",
-    gcKey: "",
     llmUrl: "",
     llmToken: "",
     llmModel: "auto",
@@ -58,7 +51,6 @@ var LyricsTranslate = (function () {
 
   const GOOGLE_CODE_MAP = { EN: "en", "EN-GB": "en", "EN-US": "en", PT: "pt", "PT-BR": "pt", "PT-PT": "pt", ZH: "zh-CN", NB: "no" };
 
-  const MS_CODE_MAP = { "EN-GB": "en", "EN-US": "en", PT: "pt", "PT-BR": "pt", "PT-PT": "pt-pt", ZH: "zh-Hans" };
 
   const ICON =
     '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="8" r="6.4"/><path d="M1.6 8h12.8M8 1.6c-2.3 2.3-2.3 10.5 0 12.8M8 1.6c2.3 2.3 2.3 10.5 0 12.8"/></svg>';
@@ -494,19 +486,22 @@ var LyricsTranslate = (function () {
     const lines = texts.map((t) => String(t).replace(/\s*\n\s*/g, " ").trim());
     const out = [];
 
-    for (const batch of batchByLimits(lines, GTX_MAX_LINES, GTX_MAX_CHARS)) {
-      if (out.length) await sleep(400);
+    // When Google merges or splits lines, the batch is halved and each half is sent again, instead
+    // of one request per line. A 60-line song then needs a few requests at most, not 60.
+    let sent = 0;
+    const translateBatch = async (batch) => {
+      if (sent++) await sleep(400);
       const json = await gtxRequest(batch.join("\n"), sl, tl);
-      let aligned = alignGtx(batch, json);
-      if (!aligned) {
-        aligned = [];
-        for (const line of batch) {
-          const one = await gtxRequest(line, sl, tl);
-          aligned.push(one[0].map(segmentText).join("").trim());
-          await sleep(400);
-        }
-      }
-      out.push(...aligned);
+      const aligned = alignGtx(batch, json);
+      if (aligned) return aligned;
+      if (batch.length === 1) return [json[0].map(segmentText).join("").trim()];
+      const half = Math.ceil(batch.length / 2);
+      const first = await translateBatch(batch.slice(0, half));
+      const second = await translateBatch(batch.slice(half));
+      return first.concat(second);
+    };
+    for (const batch of batchByLimits(lines, GTX_MAX_LINES, GTX_MAX_CHARS)) {
+      out.push(...(await translateBatch(batch)));
     }
     return out;
   }
@@ -547,97 +542,21 @@ var LyricsTranslate = (function () {
     return out;
   }
 
-  const msCode = (code) => {
-    const upper = String(code).toUpperCase();
-    return MS_CODE_MAP[upper] || upper.toLowerCase();
-  };
-
-  async function microsoftTranslate(texts, s) {
-    const to = msCode(s.targetLang);
-    const from = s.sourceLang && s.sourceLang !== "auto" ? msCode(s.sourceLang) : "";
-    let url = `${MS_ENDPOINT}?api-version=3.0&to=${encodeURIComponent(to)}`;
-    if (from) url += `&from=${encodeURIComponent(from)}`;
-    const headers = { "Content-Type": "application/json", "Ocp-Apim-Subscription-Key": String(s.msKey || "").trim() };
-    const region = String(s.msRegion || "").trim();
-    if (region) headers["Ocp-Apim-Subscription-Region"] = region;
-
-    const lines = texts.map((t) => String(t).replace(/\s*\n\s*/g, " ").trim());
-    const out = [];
-    for (const batch of batchByLimits(lines, MS_MAX_LINES, MS_MAX_CHARS)) {
-      let res;
-      try {
-        res = await fetch(url, { method: "POST", headers, body: JSON.stringify(batch.map((Text) => ({ Text }))) });
-      } catch (err) {
-        throw new LtError("Could not reach Microsoft Translator.", "NETWORK");
-      }
-      const data = await res.json().catch(() => null);
-      if (!res.ok) {
-        const msg = (data && data.error && data.error.message) || `HTTP ${res.status}`;
-        throw new LtError("Microsoft error: " + msg, "HTTP", res.status);
-      }
-      if (!Array.isArray(data) || data.length !== batch.length) {
-        throw new LtError("Microsoft returned an unexpected response.", "BAD_RESPONSE");
-      }
-      data.forEach((item) => {
-        const first = item && item.translations && item.translations[0];
-        out.push(String((first && first.text) || ""));
-      });
-    }
-    return out;
-  }
-
-  const decodeEntities = (str) =>
-    String(str)
-      .replace(/&#(\d+);/g, (m, n) => (Number(n) <= 0x10ffff ? String.fromCodePoint(Number(n)) : m))
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&amp;/g, "&");
-
-  async function googleCloudTranslate(texts, s) {
-    const url = `${GCLOUD_ENDPOINT}?key=${encodeURIComponent(String(s.gcKey || "").trim())}`;
-    const base = { target: toGoogleCode(s.targetLang), format: "text" };
-    if (s.sourceLang && s.sourceLang !== "auto") base.source = toGoogleCode(s.sourceLang);
-
-    const lines = texts.map((t) => String(t).replace(/\s*\n\s*/g, " ").trim());
-    const out = [];
-    for (const batch of batchByLimits(lines, GCLOUD_MAX_LINES, GCLOUD_MAX_CHARS)) {
-      let res;
-      try {
-        res = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(Object.assign({}, base, { q: batch })),
-        });
-      } catch (err) {
-        throw new LtError("Could not reach Google Cloud Translation.", "NETWORK");
-      }
-      const data = await res.json().catch(() => null);
-      if (!res.ok) {
-        const msg = (data && data.error && data.error.message) || `HTTP ${res.status}`;
-        throw new LtError("Google Cloud error: " + msg, "HTTP", res.status);
-      }
-      const list = data && data.data && data.data.translations;
-      if (!Array.isArray(list) || list.length !== batch.length) {
-        throw new LtError("Google Cloud returned an unexpected response.", "BAD_RESPONSE");
-      }
-      list.forEach((item) => out.push(decodeEntities(item.translatedText || "")));
-    }
-    return out;
-  }
-
-  const LLM_MODELS = ["auto", "gemini", "groq", "gptoss"];
+  const LLM_MODELS = ["auto", "gemini", "gemini35", "groq", "gptoss"];
   const llmBase = (s) => String(s.llmUrl || "").trim().replace(/\/+$/, "");
 
   // Sends all lines in one request to llm-proxy.mjs. The server tries its models in order and answers
   // with exactly one translation per line. Anything else counts as a failure, so translateTexts()
   // falls back to Google.
-  async function llmTranslate(texts, s) {
+  async function llmTranslate(texts, s, song) {
     const base = llmBase(s);
     const lines = texts.map((t) => String(t).replace(/\s+/g, " ").trim());
     const payload = { lines, target: s.targetLang, model: LLM_MODELS.includes(s.llmModel) ? s.llmModel : "auto" };
     if (s.sourceLang && s.sourceLang !== "auto") payload.source = s.sourceLang;
+    // Song details give the model context for pronouns, slang and theme. The server treats them as hints.
+    if (song && song.title) payload.title = song.title;
+    if (song && song.artist) payload.artist = song.artist;
+    if (song && song.language) payload.lyricsLang = song.language;
     const headers = { "Content-Type": "application/json" };
     const token = String(s.llmToken || "").trim();
     if (token) headers.Authorization = "Bearer " + token;
@@ -678,25 +597,29 @@ var LyricsTranslate = (function () {
 
   const PROVIDER_LABELS = {
     deepl: "DeepL",
-    microsoft: "Microsoft Translator",
-    googleCloud: "Google Cloud Translation",
     llm: "AI translation",
   };
-  const PROVIDER_KEY_FIELD = { deepl: "deeplKey", microsoft: "msKey", googleCloud: "gcKey", llm: "llmUrl" };
+  const PROVIDER_KEY_FIELD = { deepl: "deeplKey", llm: "llmUrl" };
 
-  function translateWith(provider, texts, s) {
-    if (provider === "llm") return llmTranslate(texts, s);
+  function translateWith(provider, texts, s, song) {
+    if (provider === "llm") return llmTranslate(texts, s, song);
     if (provider === "deepl") return deeplTranslate(texts, s);
-    if (provider === "microsoft") return microsoftTranslate(texts, s);
-    if (provider === "googleCloud") return googleCloudTranslate(texts, s);
     return googleTranslate(texts, s);
   }
 
-  async function translateTexts(texts, s) {
+  async function translateTexts(texts, s, song) {
     const provider = PROVIDER_LABELS[s.provider] ? s.provider : "google";
     if (provider === "google") {
-      const items = await googleTranslate(texts, s);
-      return { items, provider: "google", notice: "" };
+      try {
+        const items = await googleTranslate(texts, s);
+        return { items, provider: "google", notice: "" };
+      } catch (err) {
+        // Google's free endpoint is rate limited. When an AI server is set up, it takes over
+        // until Google answers again.
+        if (!llmBase(s) || (err.code !== "RATE_LIMIT" && err.code !== "NETWORK")) throw err;
+        const items = await llmTranslate(texts, s, song);
+        return { items, provider: "llm", notice: "Google is rate limited, so it was translated with your AI server." };
+      }
     }
     const label = PROVIDER_LABELS[provider];
     if (!String(s[PROVIDER_KEY_FIELD[provider]] || "").trim()) {
@@ -705,7 +628,7 @@ var LyricsTranslate = (function () {
       return { items, provider: "google", notice: `${label} ${missing} is not set, so it was translated with Google.` };
     }
     try {
-      const items = await translateWith(provider, texts, s);
+      const items = await translateWith(provider, texts, s, song);
       return { items, provider, notice: "" };
     } catch (err) {
       const items = await googleTranslate(texts, s);
@@ -739,6 +662,8 @@ var LyricsTranslate = (function () {
 
     const { lines, language } = await fetchLyrics(trackId);
     const trackName = item.name || "";
+    const artists = Array.isArray(item.artists) ? item.artists.map((a) => a && a.name).filter(Boolean) : [];
+    const song = { title: trackName, artist: artists.join(", "), language };
 
     const key = cacheKey(trackId, s.provider, s.targetLang, s.sourceLang);
     const selected = PROVIDER_LABELS[s.provider] ? s.provider : "google";
@@ -752,7 +677,8 @@ var LyricsTranslate = (function () {
         const cachedBy = hit.p || "";
         // The selected provider's result stays valid even when its key was removed later: replacing it
         // with the Google fallback would lose a better translation.
-        if (!cachedBy || cachedBy === wanted || cachedBy === selected) {
+        // An AI translation saved while Google was rate limited is kept too: it is at least as good.
+        if (!cachedBy || cachedBy === wanted || cachedBy === selected || (wanted === "google" && cachedBy === "llm")) {
           return { trackName, lines, translated: hit.t, provider: cachedBy, notice: "", cached: true };
         }
         // Cached by a fallback (Google, while the preferred provider was unavailable). Retry the preferred one below.
@@ -788,7 +714,7 @@ var LyricsTranslate = (function () {
     let notice = "";
     if (texts.length > 0 && fallbackHit && wanted !== "google") {
       try {
-        put(await translateWith(wanted, texts, s));
+        put(await translateWith(wanted, texts, s, song));
         provider = wanted;
       } catch (err) {
         // The preferred provider still fails: keep the saved fallback instead of calling Google again.
@@ -802,7 +728,7 @@ var LyricsTranslate = (function () {
         };
       }
     } else if (texts.length > 0) {
-      const result = await translateTexts(texts, s);
+      const result = await translateTexts(texts, s, song);
       put(result.items);
       provider = result.provider;
       notice = result.notice;
@@ -1183,8 +1109,6 @@ var LyricsTranslate = (function () {
       [
         ["google", "Google Translate (default, no key required)"],
         ["deepl", "DeepL (API key and local proxy required)"],
-        ["microsoft", "Microsoft Translator (API key and region required)"],
-        ["googleCloud", "Google Cloud Translation (API key and billing required)"],
         ["llm", "AI translation (own server: Gemini, Qwen, GPT-OSS)"],
       ],
       s.provider
@@ -1203,15 +1127,13 @@ var LyricsTranslate = (function () {
     deeplHint.appendChild(guideLink);
 
     const proxyInput = textInput("text", s.deeplProxy, DEFAULT_PROXY);
-    const msKeyInput = textInput("password", s.msKey, "Microsoft API key");
-    const msRegionInput = textInput("text", s.msRegion, "e.g. westeurope");
-    const gcKeyInput = textInput("password", s.gcKey, "Google Cloud API key");
     const llmUrlInput = textInput("text", s.llmUrl, "https://your-service.onrender.com");
     const llmTokenInput = textInput("password", s.llmToken, "Access token");
     const llmModelSel = select(
       [
         ["auto", "Auto (server order)"],
-        ["gemini", "Gemini (Google)"],
+        ["gemini", "Gemini 3.8 Flash (Google)"],
+        ["gemini35", "Gemini 3.5 Flash (Google)"],
         ["groq", "Qwen (Groq)"],
         ["gptoss", "GPT-OSS (Groq)"],
       ],
@@ -1237,10 +1159,7 @@ var LyricsTranslate = (function () {
       field("Translation provider (which service translates)", providerSel),
       field("DeepL API key", deeplInput, deeplHint),
       field("DeepL proxy address", proxyInput, el("div", "lt-note", "Start the proxy with 'node deepl-proxy.mjs'. The default address normally does not need to change.")),
-      field("Microsoft API key", msKeyInput, el("div", "lt-note", "Create a Translator resource in Azure and copy its key.")),
-      field("Microsoft region", msRegionInput, el("div", "lt-note", "The region of your resource (e.g. westeurope). Fill this in if Azure returns an error.")),
-      field("Google Cloud API key", gcKeyInput, el("div", "lt-note", "Create a key in a project where you enabled the Cloud Translation API. The free quota is 500,000 characters per month; billing must be enabled on the project.")),
-      field("AI server address", llmUrlInput, el("div", "lt-note", "Address of your llm-proxy server, e.g. https://your-service.onrender.com. Leave it empty to use Google.")),
+      field("AI server address", llmUrlInput, el("div", "lt-note", "Address of your llm-proxy server, e.g. https://your-service.onrender.com. Leave it empty to use Google. When set, it also takes over while Google is rate limited.")),
       field("AI access token", llmTokenInput, el("div", "lt-note", "The ACCESS_TOKEN value set on the server.")),
       field("AI model", llmModelSel, el("div", "lt-note", "Auto tries the server's models in order. Saved translations stay when you change the model; use “Re-translate this song” to refresh one.")),
       field("Target language (lyrics are translated into this language)", targetSel),
@@ -1276,9 +1195,6 @@ var LyricsTranslate = (function () {
             const next = Object.assign(loadSettings(), {
               provider: PROVIDER_LABELS[providerSel.value] ? providerSel.value : "google",
               deeplKey: deeplInput.value.trim(),
-              msKey: msKeyInput.value.trim(),
-              msRegion: msRegionInput.value.trim(),
-              gcKey: gcKeyInput.value.trim(),
               llmUrl: llmUrlInput.value.trim().replace(/\/+$/, ""),
               llmToken: llmTokenInput.value.trim(),
               llmModel: llmModelSel.value,
@@ -1404,11 +1320,7 @@ var LyricsTranslate = (function () {
     translateTexts,
     googleTranslate,
     deeplTranslate,
-    microsoftTranslate,
-    googleCloudTranslate,
     llmTranslate,
-    msCode,
-    decodeEntities,
     PROVIDER_LABELS,
     translateCurrentTrack,
     cacheClear,
