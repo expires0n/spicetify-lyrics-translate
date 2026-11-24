@@ -6,7 +6,10 @@
 // Environment variables:
 //   GEMINI_API_KEY   Google AI Studio key. Turns on the "gemini" and "gemma" models.
 //   GROQ_API_KEY     Groq key. Turns on the "groq" and "gptoss" models.
-//   ACCESS_TOKEN     Optional. When set, requests must send "Authorization: Bearer <token>".
+//   ACCESS_TOKEN     Requests must send "Authorization: Bearer <token>". Required when the server
+//                    listens on a non-local address (for example on Render); without it the server
+//                    refuses to start, so nobody can spend your provider keys.
+//   ALLOW_NO_TOKEN   Set to 1 to start on a non-local address without ACCESS_TOKEN anyway (not recommended).
 //   MODEL_ORDER      Models to use, in the order they are tried. Default: gemini,groq,gptoss
 //                    "gemma" is only used when it is listed here.
 //   GEMINI_MODEL, GEMMA_MODEL, GROQ_MODEL, GPTOSS_MODEL               Model IDs.
@@ -16,6 +19,7 @@
 //   GROQ_MAX_TOKENS  Upper limit for the answer length of the Groq models. Default: 4096
 
 import http from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 const env = (name, fallback) => (process.env[name] || "").trim() || fallback;
 const tokenCount = (value) => (typeof value === "number" ? value : null);
@@ -24,6 +28,25 @@ const PORT = Number(process.env.PORT) || 8788;
 const HOST = env("HOST", process.env.PORT ? "0.0.0.0" : "127.0.0.1");
 const ACCESS_TOKEN = env("ACCESS_TOKEN", "");
 const ALLOWED_ORIGIN = env("ALLOWED_ORIGIN", "*");
+const IS_LOCAL_HOST = ["127.0.0.1", "localhost", "::1"].includes(HOST);
+const ALLOW_NO_TOKEN = env("ALLOW_NO_TOKEN", "") === "1";
+
+if (!ACCESS_TOKEN && !IS_LOCAL_HOST && !ALLOW_NO_TOKEN) {
+  console.error(
+    `Refusing to start: the server would listen on ${HOST} without ACCESS_TOKEN, so anyone who finds ` +
+      "the address could spend your provider keys. Set ACCESS_TOKEN (and paste it into the extension), " +
+      "or set ALLOW_NO_TOKEN=1 if you really want an open server."
+  );
+  process.exit(1);
+}
+
+// Compares the Authorization header with the token in constant time, so the token cannot be
+// guessed from response timings.
+function tokenMatches(header) {
+  const expected = createHash("sha256").update(`Bearer ${ACCESS_TOKEN}`).digest();
+  const given = createHash("sha256").update(String(header || "")).digest();
+  return timingSafeEqual(expected, given);
+}
 
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_LINES = 400;
@@ -351,7 +374,7 @@ const server = http.createServer(async (req, res) => {
 
   const started = Date.now();
   try {
-    if (ACCESS_TOKEN && req.headers["authorization"] !== `Bearer ${ACCESS_TOKEN}`) {
+    if (ACCESS_TOKEN && !tokenMatches(req.headers["authorization"])) {
       throw httpError(401, "The access token is missing or wrong.");
     }
     if (!allowIp(req)) throw httpError(429, "Too many requests. Try again in a few minutes.");

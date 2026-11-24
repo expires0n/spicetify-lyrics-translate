@@ -6,6 +6,11 @@ This file starts with the changes that added AI translation. Earlier history is 
 
 ## [Unreleased]
 
+### Security
+
+- `llm-proxy.mjs` now refuses to start on a non-local address (such as Render) when `ACCESS_TOKEN` is not set, so an exposed server can no longer spend your Gemini or Groq quota. Set `ALLOW_NO_TOKEN=1` to override.
+- The access token is compared in constant time.
+
 ### Added
 
 - AI translation provider backed by `llm-proxy.mjs`, with Gemini 3.5 Flash-Lite (Google), Qwen 3.8 27B (Groq), and GPT-OSS 120B (Groq).

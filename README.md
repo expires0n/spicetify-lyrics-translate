@@ -145,7 +145,7 @@ You need at least one key. A key turns on every model that uses it: `GEMINI_API_
 
 ### Deploy the server
 
-Render runs the same file without changes. Create a web service, set the start command to `node llm-proxy.mjs`, add the keys, and set `ACCESS_TOKEN` before you make the service public. Render sets `PORT`, so the server listens on `0.0.0.0` and accepts requests from the extension.
+Render runs the same file without changes. Create a web service, set the start command to `node llm-proxy.mjs`, add the keys, and set `ACCESS_TOKEN`. The server refuses to start on `0.0.0.0` without it (set `ALLOW_NO_TOKEN=1` to override, not recommended). Render sets `PORT`, so the server listens on `0.0.0.0` and accepts requests from the extension.
 
 - `GET /health` returns `{"ok":true,"models":["gemini","groq","gptoss"]}` when both keys are set. An empty list means no key is set.
 - The free Render plan sleeps after 15 minutes without requests. The extension sends a health request when a song changes, at most once every 5 minutes, so the server stays awake while music plays. The first request after a sleep can take about a minute.
@@ -177,7 +177,7 @@ Changing the model does not replace saved translations. Use **Re-translate this 
 
 - API keys are stored in Spotify's local storage through Spicetify. They are never written to files in this repository, so do not add a key to the repository.
 - The DeepL proxy listens only on `127.0.0.1`.
-- The AI server listens on `127.0.0.1` when you run it locally. Set `ACCESS_TOKEN` before you expose it on the internet; without it, anyone who knows the address can use your provider keys.
+- The AI server listens on `127.0.0.1` when you run it locally. On any other address it refuses to start unless `ACCESS_TOKEN` is set, so an exposed server cannot be used by anyone who finds the address.
 - Translated text is sent to the provider you select, and to Google when a fallback happens. AI translation sends the lyrics to your server and then to Google (Gemini, Gemma) or Groq (Qwen, GPT-OSS).
 
 ## Known limitations
