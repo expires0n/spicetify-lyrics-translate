@@ -16,6 +16,12 @@ This file starts with the changes that added AI translation. Earlier history is 
 
 ### Changed
 
+- Improved AI translation quality with a rewritten prompt. The model now reads the whole song first, works out the speaker and mood, and translates meaning and feeling instead of word for word.
+- Better handling of rap and hip-hop lyrics: slang is translated by its meaning with matching slang in the target language, the tone is kept, and terms of address are no longer translated literally.
+- Much better Japanese translations: the prompt now covers dropped subjects, sentences that run over several lines, onomatopoeia, katakana loanwords and romaji. Korean and Chinese lyrics get similar guidance.
+- The extension now sends the song title, artist and Spotify's lyrics language to the AI server as optional context hints.
+- Repeated lines now get the same translation, and instructions hidden inside lyrics are ignored.
+
 - The README, manifest, and extension description now list AI translation as a provider.
 - DeepL and the AI server require Node.js 18 or newer.
 - The settings button is described as a globe button in the documentation.

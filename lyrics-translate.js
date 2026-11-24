@@ -633,11 +633,15 @@ var LyricsTranslate = (function () {
   // Sends all lines in one request to llm-proxy.mjs. The server tries its models in order and answers
   // with exactly one translation per line. Anything else counts as a failure, so translateTexts()
   // falls back to Google.
-  async function llmTranslate(texts, s) {
+  async function llmTranslate(texts, s, song) {
     const base = llmBase(s);
     const lines = texts.map((t) => String(t).replace(/\s+/g, " ").trim());
     const payload = { lines, target: s.targetLang, model: LLM_MODELS.includes(s.llmModel) ? s.llmModel : "auto" };
     if (s.sourceLang && s.sourceLang !== "auto") payload.source = s.sourceLang;
+    // Song details give the model context for pronouns, slang and theme. The server treats them as hints.
+    if (song && song.title) payload.title = song.title;
+    if (song && song.artist) payload.artist = song.artist;
+    if (song && song.language) payload.lyricsLang = song.language;
     const headers = { "Content-Type": "application/json" };
     const token = String(s.llmToken || "").trim();
     if (token) headers.Authorization = "Bearer " + token;
@@ -684,15 +688,15 @@ var LyricsTranslate = (function () {
   };
   const PROVIDER_KEY_FIELD = { deepl: "deeplKey", microsoft: "msKey", googleCloud: "gcKey", llm: "llmUrl" };
 
-  function translateWith(provider, texts, s) {
-    if (provider === "llm") return llmTranslate(texts, s);
+  function translateWith(provider, texts, s, song) {
+    if (provider === "llm") return llmTranslate(texts, s, song);
     if (provider === "deepl") return deeplTranslate(texts, s);
     if (provider === "microsoft") return microsoftTranslate(texts, s);
     if (provider === "googleCloud") return googleCloudTranslate(texts, s);
     return googleTranslate(texts, s);
   }
 
-  async function translateTexts(texts, s) {
+  async function translateTexts(texts, s, song) {
     const provider = PROVIDER_LABELS[s.provider] ? s.provider : "google";
     if (provider === "google") {
       const items = await googleTranslate(texts, s);
@@ -705,7 +709,7 @@ var LyricsTranslate = (function () {
       return { items, provider: "google", notice: `${label} ${missing} is not set, so it was translated with Google.` };
     }
     try {
-      const items = await translateWith(provider, texts, s);
+      const items = await translateWith(provider, texts, s, song);
       return { items, provider, notice: "" };
     } catch (err) {
       const items = await googleTranslate(texts, s);
@@ -739,6 +743,8 @@ var LyricsTranslate = (function () {
 
     const { lines, language } = await fetchLyrics(trackId);
     const trackName = item.name || "";
+    const artists = Array.isArray(item.artists) ? item.artists.map((a) => a && a.name).filter(Boolean) : [];
+    const song = { title: trackName, artist: artists.join(", "), language };
 
     const key = cacheKey(trackId, s.provider, s.targetLang, s.sourceLang);
     const selected = PROVIDER_LABELS[s.provider] ? s.provider : "google";
@@ -788,7 +794,7 @@ var LyricsTranslate = (function () {
     let notice = "";
     if (texts.length > 0 && fallbackHit && wanted !== "google") {
       try {
-        put(await translateWith(wanted, texts, s));
+        put(await translateWith(wanted, texts, s, song));
         provider = wanted;
       } catch (err) {
         // The preferred provider still fails: keep the saved fallback instead of calling Google again.
@@ -802,7 +808,7 @@ var LyricsTranslate = (function () {
         };
       }
     } else if (texts.length > 0) {
-      const result = await translateTexts(texts, s);
+      const result = await translateTexts(texts, s, song);
       put(result.items);
       provider = result.provider;
       notice = result.notice;
