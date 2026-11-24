@@ -229,7 +229,7 @@ function buildPrompt(job) {
     "Tone, slang and rap:",
     `- Keep the tone exactly. Street talk stays street talk, tender lines stay tender, angry lines stay angry. Do not censor or soften anything, and do not make it more formal.`,
     `- Translate slang by what it means, using equivalent ${to} slang of the same register. Never translate slang literally. For example in English rap, "bands" or "racks" means money, "opps" means enemies, "drip" means style, "no cap" means \"for real\", "bet" means \"okay\", "trap" means a drug house or the hustle, "shorty" usually means a girl, "slide" can mean to go after rivals or to come over.`,
-    `- In rap, the n-word ("nigga") is almost always a term of address or a word for a friend or a person, like \"bro\" or \"dude\". Translate it by that function with the natural ${to} street equivalent. Never turn it into a literal racial word in ${to}.`,
+    '- Keep the n-word ("nigga", "nigger" and their plurals) exactly as written in the original. Do not translate, censor or replace it.',
     "- Keep the energy of brags, threats and punchlines. When a pun cannot survive, keep the point of the line instead of a broken literal version.",
     "",
     "Format rules:",
