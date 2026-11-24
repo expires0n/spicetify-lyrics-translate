@@ -6,6 +6,8 @@
 
 A [Spicetify](https://spicetify.app) extension that shows translations directly below Spotify's lyrics.
 
+[Türkçe README](README.tr.md)
+
 > **Status: experimental.** This project is a work in progress and is not stable yet. Lyrics come from Spotify's internal endpoints, Google Translate uses an unofficial endpoint, and AI translation depends on your own server and provider keys. An update to any of them can break things at any time, so expect bugs and rough edges. Please report problems in the issues tab.
 
 ## Features
@@ -14,21 +16,19 @@ A [Spicetify](https://spicetify.app) extension that shows translations directly 
 - Choose a translation provider:
   - **Google Translate**: default, no API key needed (unofficial, see below).
   - **DeepL**: your API key plus a small local proxy included in this repository.
-  - **Microsoft Translator**: your API key and resource region.
-  - **Google Cloud Translation**: your API key, with billing enabled on the project.
-  - **AI translation**: your own `llm-proxy.mjs` server, with Gemini, Qwen on Groq, or GPT-OSS 120B; pick a model or let the server decide.
+  - **AI translation**: your own `llm-proxy.mjs` server, with Gemini 3.8 Flash, Gemini 3.5 Flash, Qwen on Groq, or GPT-OSS 120B; pick a model or let the server decide.
 - Choose the target and source language. The language list is in English, and language codes are converted automatically for each provider.
 - A translation button (globe icon) appears next to Spotify's lyrics button in the playback bar:
   - Left-click: show or hide the translation.
   - Right-click: open the settings.
 - If the selected provider fails (missing key, proxy not running, AI server unreachable, error, or quota used up), the extension uses Google for that request and shows why.
 - Translations are cached per track, so the same song is not translated twice.
-- If Google rate-limits requests, the extension pauses Google requests for a growing period instead of retrying constantly.
+- If Google rate-limits requests, the extension pauses Google requests for a growing period instead of retrying constantly. When an AI server is set up, it translates in the meantime.
 
 ## Requirements
 
 - Spicetify, installed and working with Spotify.
-- Node.js 18 or newer, for DeepL or the AI server. Google Translate, Microsoft Translator, and Google Cloud Translation run without it.
+- Node.js 18 or newer, for DeepL or the AI server. Google Translate runs without it.
 
 ## Installation
 
@@ -50,8 +50,6 @@ A [Spicetify](https://spicetify.app) extension that shows translations directly 
 | --- | --- | --- | --- |
 | Google Translate | No | None | Unofficial endpoint, may be rate-limited or blocked |
 | DeepL | Yes (DeepL API key) | Local proxy (Node.js) | 500,000 characters per month |
-| Microsoft Translator | Yes (key and region) | Azure Translator resource | Free F0 tier |
-| Google Cloud Translation | Yes (API key) | Billing enabled on the project | 500,000 characters per month |
 | AI translation | Yes (Gemini and/or Groq key) | Self-hosted `llm-proxy.mjs` (Node.js) | Free tiers at Google AI Studio and Groq |
 
 ## Google Translate (default, no key)
@@ -60,10 +58,11 @@ The extension uses the same unofficial endpoint as Google's translate web widget
 
 - It needs no key and no setup. It is also the fallback for every other provider.
 - It is **not an official API**. Google does not support it for third-party use, does not promise it will keep working, and can change or block it at any time.
-- Google rate-limits heavy use (HTTP 429). The extension reduces requests by translating each song in batches of up to 30 lines and by caching results. If you play many songs in a short time, Google may still block your connection for a while.
+- Google rate-limits heavy use (HTTP 429). The extension reduces requests by sending a whole song (up to 120 lines or 5,000 characters) in one request, by splitting a batch in half instead of retrying line by line when Google merges lines, and by caching results. If you play many songs in a short time, Google may still block your connection for a while.
 - When Google blocks a request, the browser shows **"Failed to fetch"**. A blocked response does not include the header a browser needs to read its status code, so the browser only reports a generic network failure.
 - The extension then pauses Google requests: 2 minutes after the first block, then 4, 8, 16, and at most 30 minutes. Automatic retries stop during that time, and the error message shows how long is left. The wait is stored in Spotify's local storage, so **restarting Spotify does not clear it**. Clicking the button does not bypass it either.
-- For reliable translations, use DeepL, Microsoft Translator, Google Cloud Translation, or the AI server with your own key. The extension still falls back to Google if they fail.
+- If you also enter an AI server address in the settings, the AI server translates while Google is blocked, even when Google Translate is the selected provider.
+- For reliable translations, use DeepL or the AI server with your own key. The extension still falls back to Google if they fail.
 
 ## DeepL (API key + local proxy)
 
@@ -91,42 +90,25 @@ When DeepL is not available, the extension uses Google for that request and show
 - **"Could not reach the DeepL proxy"**: the proxy is not running, or it is on a different port.
 - **"DeepL error: …"**: DeepL rejected the request. Usually the key is wrong or the monthly quota is used up. Check your usage in your DeepL account.
 
-## Microsoft Translator (API key + region)
-
-The extension calls Azure AI Translator (v3) directly from the browser, so no proxy is needed.
-
-1. In the Azure portal, create a **Translator** resource. The free F0 tier is available.
-2. Open the resource's **Keys and Endpoint** page and copy a key and the resource **region** (for example `westeurope`).
-3. Right-click the globe button, select **Microsoft Translator**, enter the key and the region, and click **Save**.
-
-## Google Cloud Translation (API key + billing)
-
-The extension calls the official Cloud Translation API (v2) directly from the browser.
-
-1. In a Google Cloud project, enable the **Cloud Translation API** and link a billing account. Billing is required even for the free quota.
-2. Under **Credentials**, create an API key and restrict it to the Cloud Translation API.
-3. Right-click the globe button, select **Google Cloud Translation**, enter the key, and click **Save**.
-
-The free quota is 500,000 characters per month. Usage beyond that is billed.
-
 ## AI translation (own server)
 
 The AI provider sends the whole song to `llm-proxy.mjs`, a dependency-free Node.js server. The server asks a large language model for one translation per line, tries its models in order, and returns the first complete answer. If the server or every model fails, the extension falls back to Google.
 
-The server is set up for three models:
+The server is set up for four models, tried in this order:
 
-- **Gemini**: `gemini-3.5-flash-lite`, through a Google AI Studio key.
+- **Gemini 3.8 Flash**: `gemini-3.8-flash`, through a Google AI Studio key.
+- **Gemini 3.5 Flash**: `gemini-3.5-flash`, same key. Takes over when the 3.8 Flash free quota runs out, because each model has its own quota.
 - **Qwen**: `qwen/qwen3.8-27b`, through a Groq key.
 - **GPT-OSS**: `openai/gpt-oss-120b`, through a Groq key.
 
-`MODEL_ORDER` controls the order and defaults to `gemini,groq,gptoss`. Gemma (`gemma-4-31b-it`) is available when you add `gemma` to `MODEL_ORDER` and set `GEMINI_API_KEY`.
+`MODEL_ORDER` controls the order and defaults to `gemini,gemini35,groq,gptoss`. Gemma (`gemma-4-31b-it`) is available when you add `gemma` to `MODEL_ORDER` and set `GEMINI_API_KEY`.
 
 ### Get the API keys
 
 - Create a Gemini key at https://aistudio.google.com/apikey.
 - Create a Groq key at https://console.groq.com/keys.
 
-You need at least one key. A key turns on every model that uses it: `GEMINI_API_KEY` turns on Gemini and Gemma, and `GROQ_API_KEY` turns on Qwen and GPT-OSS.
+You need at least one key. A key turns on every model that uses it: `GEMINI_API_KEY` turns on both Gemini models and Gemma, and `GROQ_API_KEY` turns on Qwen and GPT-OSS.
 
 ### Run the server locally
 
@@ -147,7 +129,7 @@ You need at least one key. A key turns on every model that uses it: `GEMINI_API_
 
 Render runs the same file without changes. Create a web service, set the start command to `node llm-proxy.mjs`, add the keys, and set `ACCESS_TOKEN` before you make the service public. Render sets `PORT`, so the server listens on `0.0.0.0` and accepts requests from the extension.
 
-- `GET /health` returns `{"ok":true,"models":["gemini","groq","gptoss"]}` when both keys are set. An empty list means no key is set.
+- `GET /health` returns `{"ok":true,"models":["gemini","gemini35","groq","gptoss"]}` when both keys are set. An empty list means no key is set.
 - The free Render plan sleeps after 15 minutes without requests. The extension sends a health request when a song changes, at most once every 5 minutes, so the server stays awake while music plays. The first request after a sleep can take about a minute.
 - Set `ACCESS_TOKEN` on the server and paste the same value into **AI access token** in the extension. Without a token, anyone who knows the address can spend your quota.
 - `ALLOWED_ORIGIN` controls CORS. The default `*` works for every Spotify origin; set a specific origin if you want to restrict it.
@@ -162,14 +144,14 @@ Render runs the same file without changes. Create a web service, set the start c
 | Requests per IP address | 40 per 10 minutes |
 | Request timeout | 40s total, 20s per model |
 
-The server rejects a request outside these limits. After a provider rate limit (HTTP 429), that model is paused for 60s and the next model is tried. Missing or empty lines count as a failed answer, so the server rejects the whole reply and moves on. `IP_MAX_REQUESTS`, `GROQ_MAX_TOKENS`, and the model ID variables change the defaults. The comments at the top of `llm-proxy.mjs` list every variable.
+The server rejects a request outside these limits. After a provider rate limit (HTTP 429), that model is paused for 60s (one hour when the error names a daily quota) and the next model is tried. Missing or empty lines count as a failed answer, so the server rejects the whole reply and moves on. `IP_MAX_REQUESTS`, `GROQ_MAX_TOKENS`, and the model ID variables change the defaults. The comments at the top of `llm-proxy.mjs` list every variable.
 
 ### Choose a model
 
-The **AI model** setting has four values:
+The **AI model** setting has five values:
 
 - **Auto** uses the server order.
-- **Gemini**, **Qwen (Groq)**, and **GPT-OSS (Groq)** start with that model and fall back to the rest.
+- **Gemini 3.8 Flash**, **Gemini 3.5 Flash**, **Qwen (Groq)**, and **GPT-OSS (Groq)** start with that model and fall back to the rest.
 
 Changing the model does not replace saved translations. Use **Re-translate this song** to refresh the current song.
 

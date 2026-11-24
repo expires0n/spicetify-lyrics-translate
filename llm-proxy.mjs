@@ -4,13 +4,13 @@
 //   Render:  start command "node llm-proxy.mjs" (Render sets PORT, so the server listens on 0.0.0.0)
 //
 // Environment variables:
-//   GEMINI_API_KEY   Google AI Studio key. Turns on the "gemini" and "gemma" models.
+//   GEMINI_API_KEY   Google AI Studio key. Turns on the "gemini", "gemini35" and "gemma" models.
 //   GROQ_API_KEY     Groq key. Turns on the "groq" and "gptoss" models.
 //   ACCESS_TOKEN     Optional. When set, requests must send "Authorization: Bearer <token>".
-//   MODEL_ORDER      Models to use, in the order they are tried. Default: gemini,groq,gptoss
+//   MODEL_ORDER      Models to use, in the order they are tried. Default: gemini,gemini35,groq,gptoss
 //                    "gemma" is only used when it is listed here.
-//   GEMINI_MODEL, GEMMA_MODEL, GROQ_MODEL, GPTOSS_MODEL               Model IDs.
-//   GEMINI_THINKING, GEMMA_THINKING, GROQ_THINKING, GPTOSS_THINKING   Thinking level sent to the model.
+//   GEMINI_MODEL, GEMINI35_MODEL, GEMMA_MODEL, GROQ_MODEL, GPTOSS_MODEL                    Model IDs.
+//   GEMINI_THINKING, GEMINI35_THINKING, GEMMA_THINKING, GROQ_THINKING, GPTOSS_THINKING     Thinking level.
 //   ALLOWED_ORIGIN   CORS origin. Default: *
 //   IP_MAX_REQUESTS  Requests allowed per address in 10 minutes. Default: 40
 //   GROQ_MAX_TOKENS  Upper limit for the answer length of the Groq models. Default: 4096
@@ -37,6 +37,8 @@ const MODEL_TIMEOUT_MS = 20000;
 const MODEL_RESERVE_MS = 8000;
 const MIN_TRY_MS = 3000;
 const RATE_LIMIT_PAUSE_MS = 60 * 1000;
+// A used-up daily quota does not come back in a minute, so that model is skipped for longer.
+const DAILY_LIMIT_PAUSE_MS = 60 * 60 * 1000;
 const IP_WINDOW_MS = 10 * 60 * 1000;
 const IP_MAX_REQUESTS = Number(env("IP_MAX_REQUESTS", "40")) || 40;
 const GROQ_MAX_TOKENS = Number(env("GROQ_MAX_TOKENS", "4096")) || 4096;
@@ -45,20 +47,24 @@ const GROQ_THINKING_TOKENS = 1024;
 const GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta/models/";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 
-// Model IDs, thinking levels and sampling settings were checked on the providers' pages on 2026-11-13.
+// Model IDs, thinking levels and sampling settings were checked on the providers' pages on 2026-11-24.
+// Gemini 3.8 Flash is tried first. When its free quota runs out, Gemini 3.5 Flash takes over
+// (each model has its own quota), then Qwen and GPT-OSS on Groq.
 // They change often: set the environment variables instead of editing this file.
-//   gemini   "minimal" is the model's own default and its fastest level; "low", "medium" and "high" think more.
+//   gemini, gemini35   "minimal" is the fastest level; "low" (default here) thinks a little for better
+//                      translations; "medium" and "high" think more.
 //   gemma    "minimal" turns thinking off, "high" turns it on.
 //   groq     "none" turns thinking off; "low", "medium" and "high" turn it on.
 //   gptoss   "low", "medium" or "high". This model always thinks.
-// No temperature is sent to Google: Gemini 3.5 Flash-Lite ignores it and later models will reject it.
+// No temperature is sent to Google: Gemini 3 models ignore or reject it.
 const MODELS = {
-  gemini: { api: "google", key: env("GEMINI_API_KEY", ""), model: env("GEMINI_MODEL", "gemini-3.5-flash-lite"), thinking: env("GEMINI_THINKING", "minimal").toLowerCase() },
+  gemini: { api: "google", key: env("GEMINI_API_KEY", ""), model: env("GEMINI_MODEL", "gemini-3.8-flash"), thinking: env("GEMINI_THINKING", "low").toLowerCase() },
+  gemini35: { api: "google", key: env("GEMINI_API_KEY", ""), model: env("GEMINI35_MODEL", "gemini-3.5-flash"), thinking: env("GEMINI35_THINKING", "low").toLowerCase() },
   gemma: { api: "google", key: env("GEMINI_API_KEY", ""), model: env("GEMMA_MODEL", "gemma-4-31b-it"), thinking: env("GEMMA_THINKING", "minimal").toLowerCase() },
   groq: { api: "groq", key: env("GROQ_API_KEY", ""), model: env("GROQ_MODEL", "qwen/qwen3.8-27b"), thinking: env("GROQ_THINKING", "none").toLowerCase(), temperature: 0.5, topP: 0.8 },
   gptoss: { api: "groq", key: env("GROQ_API_KEY", ""), model: env("GPTOSS_MODEL", "openai/gpt-oss-120b"), thinking: env("GPTOSS_THINKING", "low").toLowerCase(), temperature: 0.5 },
 };
-const ORDER = env("MODEL_ORDER", "gemini,groq,gptoss")
+const ORDER = env("MODEL_ORDER", "gemini,gemini35,groq,gptoss")
   .split(",")
   .map((name) => name.trim().toLowerCase())
   .filter((name, i, all) => MODELS[name] && MODELS[name].key && all.indexOf(name) === i);
@@ -391,7 +397,10 @@ async function translate(job) {
         failed,
       };
     } catch (err) {
-      if (err.status === 429) slot.pausedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
+      if (err.status === 429) {
+        const daily = /per ?day|daily/i.test(err.message);
+        slot.pausedUntil = Date.now() + (daily ? DAILY_LIMIT_PAUSE_MS : RATE_LIMIT_PAUSE_MS);
+      }
       console.log(`[llm-proxy] ${name} failed after ${Date.now() - started} ms: ${err.message}`);
       failed.push(`${name}: ${err.message}`);
     }

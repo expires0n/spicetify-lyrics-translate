@@ -6,8 +6,14 @@ This file starts with the changes that added AI translation. Earlier history is 
 
 ## [Unreleased]
 
+### Removed
+
+- Microsoft Translator and Google Cloud Translation providers, with their settings. Saved settings that pointed to them fall back to Google Translate.
+
 ### Added
 
+- Turkish README (`README.tr.md`).
+- Gemini 3.5 Flash option in the AI model picker.
 - AI translation provider backed by `llm-proxy.mjs`, with Gemini 3.5 Flash-Lite (Google), Qwen 3.8 27B (Groq), and GPT-OSS 120B (Groq).
 - Model picker with Auto, Gemini, Qwen, and GPT-OSS options. Auto follows the server's `MODEL_ORDER`.
 - Optional bearer token for the AI server, a per-address request limit, a `/health` endpoint, and automatic model fallback on failure or rate limit.
@@ -21,7 +27,10 @@ This file starts with the changes that added AI translation. Earlier history is 
 - Much better Japanese translations: the prompt now covers dropped subjects, sentences that run over several lines, onomatopoeia, katakana loanwords and romaji. Korean and Chinese lyrics get similar guidance.
 - The extension now sends the song title, artist and Spotify's lyrics language to the AI server as optional context hints.
 - Repeated lines now get the same translation, and instructions hidden inside lyrics are ignored.
-
+- The AI server now tries Gemini 3.8 Flash first, then Gemini 3.5 Flash when the 3.8 Flash quota runs out, then Qwen and GPT-OSS. Default model order is `gemini,gemini35,groq,gptoss`, and Gemini uses the `low` thinking level by default.
+- A model whose daily quota is used up is skipped for an hour instead of a minute.
+- Google Translate now sends a whole song (up to 120 lines or 5,000 characters) in one request, and splits a batch in half instead of retrying line by line when lines come back merged. This cuts the number of requests and makes rate limits much rarer.
+- When Google Translate is rate limited and an AI server address is set, the AI server translates instead of failing.
 - The README, manifest, and extension description now list AI translation as a provider.
 - DeepL and the AI server require Node.js 18 or newer.
 - The settings button is described as a globe button in the documentation.
